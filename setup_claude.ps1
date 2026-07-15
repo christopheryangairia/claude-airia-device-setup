@@ -1,0 +1,337 @@
+# =============================================================================
+# Airia - Claude Desktop Gateway Setup (Windows PowerShell Version)
+#
+# Purpose:
+#   This script sets up Claude Desktop to run through the Airia inference
+#   gateway for a specific user. It will:
+#     1. Ask for / infer the Airia region (from a BASE_URL like the one in
+#        run.sh, e.g. https://sg01.api.airia.ai -> region "sg01")
+#     2. Ask for the AI Gateway URL (suggesting the standard pattern for the
+#        detected region: https://<region>.gateway.airia.ai/)
+#     3. Ask for the user's email address
+#     4. Request a personal Gateway API key from Airia (User key type) using
+#        that email
+#     5. Derive the OTLP endpoint from the same BASE_URL, and ask for the
+#        OTLP API key (X-API-Key header used for telemetry ingestion)
+#     6. Optionally ask for an MCP server name + URL to manage
+#     7. Fill in the Windows (.reg) and/or macOS (.mobileconfig) config
+#        template with all of the above
+#     8. Save the finished, ready-to-install file(s) to ./generated/
+# =============================================================================
+
+$ErrorActionPreference = "Stop"
+
+$SCRIPT_DIR = $PSScriptRoot
+$OUT_DIR = Join-Path $SCRIPT_DIR "generated"
+
+# Load environment variables from .env (if present). Keys should be named
+# `MINT_API_KEY` and `GATEWAY_CONFIGURATION_ID`. Values are set in-process.
+$ENV_FILE = Join-Path $SCRIPT_DIR ".env"
+function Load-EnvFile {
+    param($path)
+    if (-not (Test-Path $path)) { return }
+    Get-Content $path | ForEach-Object {
+        # Strip inline comments (everything from an unquoted # onward), then trim.
+        $line = ($_ -split '#', 2)[0].Trim()
+        if ($line -eq "") { return }
+        if ($line -match '^\s*([^=]+?)\s*=\s*(.*)\s*$') {
+            $name = $Matches[1].Trim()
+            $value = $Matches[2].Trim()
+            # Remove surrounding quotes if present
+            if ($value.StartsWith('"') -and $value.EndsWith('"')) { $value = $value.Trim('"') }
+            if ($value.StartsWith("'") -and $value.EndsWith("'")) { $value = $value.Trim("'") }
+            [System.Environment]::SetEnvironmentVariable($name, $value, "Process")
+        }
+    }
+}
+
+Load-EnvFile $ENV_FILE
+
+$REG_TEMPLATE = Join-Path $SCRIPT_DIR "Claude.reg"
+$MOBILECONFIG_TEMPLATE = Join-Path $SCRIPT_DIR "Claude.mobileconfig"
+
+# -----------------------------------------------------------------------------
+# Fixed admin credentials used only to mint a personal user API key.
+# These are tied to a specific Airia gateway configuration - update them if
+# your organization uses a different admin key / configuration id.
+# The script will read `MINT_API_KEY` and `GATEWAY_CONFIGURATION_ID` from a
+# local `.env` file (or the process environment) if set.
+# -----------------------------------------------------------------------------
+$MINT_API_KEY = if ($env:MINT_API_KEY) { $env:MINT_API_KEY } else { "" }
+$GATEWAY_CONFIGURATION_ID = if ($env:GATEWAY_CONFIGURATION_ID) { $env:GATEWAY_CONFIGURATION_ID } else { "" }
+$KEY_TYPE = "User"
+$ENABLED = $true
+
+Write-Host "============================================================"
+Write-Host " Claude Desktop - Airia Gateway Setup"
+Write-Host "============================================================"
+Write-Host "This will request a personal Airia gateway API key for a user"
+Write-Host "and generate a ready-to-install Claude Desktop config file"
+Write-Host "(Windows .reg and/or macOS .mobileconfig) with that key baked in."
+Write-Host ""
+
+# -----------------------------------------------------------------------------
+# 1. Ask for / infer the region from a BASE_URL (same value used in run.sh)
+# -----------------------------------------------------------------------------
+$BASE_URL_INPUT = (Read-Host "Enter your Airia BASE_URL (same as BASE_URL in run.sh, e.g. https://sg01.api.airia.ai)").TrimEnd('/')
+if ([string]::IsNullOrWhiteSpace($BASE_URL_INPUT)) {
+    Write-Host "Error: BASE_URL is required." -ForegroundColor Red
+    Read-Host "Press Enter to exit"
+    Exit
+}
+
+$REGION = ""
+if ($BASE_URL_INPUT -match '^https?://([A-Za-z0-9-]+)\.api\.airia\.ai$') {
+    $REGION = $Matches[1].ToLower()
+    Write-Host ""
+    Write-Host "Detected region: $REGION"
+} else {
+    Write-Host ""
+    Write-Host "Could not auto-detect a standard region (expected <region>.api.airia.ai)."
+    Write-Host "Treating this as a custom endpoint."
+}
+
+$regionPrompt = if ($REGION) { "Region (detected: $REGION) - press Enter to accept, or type a custom region code" } else { "Region - press Enter to skip, or type a custom region code" }
+$REGION_OVERRIDE = Read-Host $regionPrompt
+if (-not [string]::IsNullOrWhiteSpace($REGION_OVERRIDE)) {
+    $REGION = $REGION_OVERRIDE.ToLower()
+}
+
+$BASE_URL = $BASE_URL_INPUT
+Write-Host "Using BASE_URL: $BASE_URL"
+Write-Host ""
+
+# -----------------------------------------------------------------------------
+# 2. Ask for the AI Gateway URL
+# -----------------------------------------------------------------------------
+Write-Host "Go to the Airia Platform > Gateway settings to retrieve your AI Gateway"
+Write-Host "URL. If you don't have access, ask your Admin."
+if ($REGION) {
+    $SUGGESTED_GATEWAY = "https://$REGION.gateway.airia.ai"
+    Write-Host "Based on region '$REGION', it is likely: $SUGGESTED_GATEWAY/"
+    $GATEWAY_INPUT = Read-Host "Enter the AI Gateway URL [$SUGGESTED_GATEWAY]"
+    $AIRIA_AI_GATEWAY = if ([string]::IsNullOrWhiteSpace($GATEWAY_INPUT)) { $SUGGESTED_GATEWAY } else { $GATEWAY_INPUT }
+} else {
+    $AIRIA_AI_GATEWAY = Read-Host "Enter the AI Gateway URL"
+}
+$AIRIA_AI_GATEWAY = $AIRIA_AI_GATEWAY.TrimEnd('/')
+if ([string]::IsNullOrWhiteSpace($AIRIA_AI_GATEWAY)) {
+    Write-Host "Error: AI Gateway URL is required." -ForegroundColor Red
+    Read-Host "Press Enter to exit"
+    Exit
+}
+Write-Host "Using AI Gateway URL: $AIRIA_AI_GATEWAY"
+Write-Host ""
+
+# -----------------------------------------------------------------------------
+# 3. Ask for email
+# -----------------------------------------------------------------------------
+$USER_EMAIL = Read-Host "Enter the user's email address"
+if ([string]::IsNullOrWhiteSpace($USER_EMAIL)) {
+    Write-Host "Error: email address is required." -ForegroundColor Red
+    Read-Host "Press Enter to exit"
+    Exit
+}
+
+# Derive initials from the email's local part (used for output filenames)
+$LOCAL_PART = $USER_EMAIL.Split('@')[0]
+$INITIALS = ""
+
+if ($LOCAL_PART -match '[._-]') {
+    $parts = $LOCAL_PART -split '[._-]'
+    foreach ($part in $parts) {
+        if ($part.Length -gt 0) {
+            $INITIALS += $part.Substring(0, 1)
+            if ($INITIALS.Length -ge 2) { break }
+        }
+    }
+}
+
+if ($INITIALS.Length -lt 2) {
+    if ($LOCAL_PART.Length -ge 2) {
+        $INITIALS = $LOCAL_PART.Substring(0, 2)
+    } else {
+        $INITIALS = $LOCAL_PART
+    }
+}
+$INITIALS = $INITIALS.ToUpper()
+
+$INITIALS_OVERRIDE = Read-Host "Derived initials for filenames: $INITIALS  (press Enter to accept, or type your own)"
+if (-not [string]::IsNullOrWhiteSpace($INITIALS_OVERRIDE)) {
+    $INITIALS = $INITIALS_OVERRIDE.ToUpper()
+}
+
+Write-Host ""
+Write-Host "Using email:    $USER_EMAIL"
+Write-Host "Using initials: $INITIALS"
+Write-Host ""
+
+# -----------------------------------------------------------------------------
+# 4. Create the gateway API key
+# -----------------------------------------------------------------------------
+Write-Host "Requesting gateway API key from Airia..."
+
+$ENDPOINT = "$BASE_URL/v1/GatewayApiKey"
+$BODY = @{
+    gatewayConfigurationId = $GATEWAY_CONFIGURATION_ID
+    type                   = $KEY_TYPE
+    enabled                = $ENABLED
+    email                  = $USER_EMAIL
+} | ConvertTo-Json
+
+$headers = @{
+    "Content-Type" = "application/json"
+    "X-API-Key"    = $MINT_API_KEY
+}
+
+try {
+    $response = Invoke-RestMethod -Uri $ENDPOINT -Method Post -Headers $headers -Body $BODY
+    $USER_API_KEY = $response.apiKey
+} catch {
+    Write-Host "Error: gateway API key request failed." -ForegroundColor Red
+    if ($_.Exception.Response) {
+        $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
+        Write-Host "Response: $($reader.ReadToEnd())" -ForegroundColor Red
+    } else {
+        Write-Host "Exception: $($_.Exception.Message)" -ForegroundColor Red
+    }
+    Read-Host "Press Enter to exit"
+    Exit
+}
+
+if ([string]::IsNullOrWhiteSpace($USER_API_KEY)) {
+    Write-Host "Error: could not extract apiKey from response." -ForegroundColor Red
+    Read-Host "Press Enter to exit"
+    Exit
+}
+
+Write-Host "API key created successfully."
+Write-Host ""
+
+# -----------------------------------------------------------------------------
+# 5. OTLP endpoint (derived from BASE_URL) + OTLP API key
+#    Defaults to the same admin key used to mint the gateway key (MINT_API_KEY)
+#    unless the user wants to provide a separate one for telemetry ingestion.
+# -----------------------------------------------------------------------------
+$OTLP_ENDPOINT_BASE = $BASE_URL
+Write-Host "OTLP endpoint will be: $OTLP_ENDPOINT_BASE/v1/ClaudeCodeOtelIngest/ingest"
+
+$OTLP_KEY_CHOICE = Read-Host "Provide a separate OTLP API key (X-API-Key header for telemetry ingestion)? [y/N]"
+if ($OTLP_KEY_CHOICE -match '^[Yy]') {
+    $OTLP_API_KEY = Read-Host "Enter the OTLP API key"
+    if ([string]::IsNullOrWhiteSpace($OTLP_API_KEY)) {
+        Write-Host "Error: OTLP API key is required if you opt to provide one." -ForegroundColor Red
+        Read-Host "Press Enter to exit"
+        Exit
+    }
+} else {
+    $OTLP_API_KEY = $MINT_API_KEY
+    Write-Host "Using the same key as MINT_API_KEY for OTLP ingestion."
+}
+Write-Host ""
+
+# -----------------------------------------------------------------------------
+# 6. Optional MCP server
+# -----------------------------------------------------------------------------
+$MCP_ENABLED = $false
+$MCP_NAME = ""
+$MCP_URL = ""
+$MCP_CHOICE = Read-Host "Set up a managed MCP server? [y/N]"
+if ($MCP_CHOICE -match '^[Yy]') {
+    $MCP_ENABLED = $true
+    $MCP_NAME = Read-Host "MCP server name"
+    $MCP_URL = Read-Host "MCP server URL"
+    if ([string]::IsNullOrWhiteSpace($MCP_NAME) -or [string]::IsNullOrWhiteSpace($MCP_URL)) {
+        Write-Host "Error: MCP server name and URL are both required if you opt in." -ForegroundColor Red
+        Read-Host "Press Enter to exit"
+        Exit
+    }
+}
+Write-Host ""
+
+# -----------------------------------------------------------------------------
+# 7. Ask which platform config(s) to generate
+# -----------------------------------------------------------------------------
+Write-Host "Which config file should be generated?"
+Write-Host "  1) Windows (.reg)"
+Write-Host "  2) macOS (.mobileconfig)"
+Write-Host "  3) Both"
+$PLATFORM_CHOICE = Read-Host "Choose [1/2/3]"
+
+if (-not (Test-Path $OUT_DIR)) {
+    New-Item -ItemType Directory -Path $OUT_DIR | Out-Null
+}
+
+# -----------------------------------------------------------------------------
+# 8. Fill templates
+# -----------------------------------------------------------------------------
+if ($MCP_ENABLED) {
+    $MCP_ARRAY_PLAIN = '[{"name":"' + $MCP_NAME + '","transport":"http","url":"' + $MCP_URL + '","oauth":{"mode":"dcr"}}]'
+} else {
+    $MCP_ARRAY_PLAIN = '[]'
+}
+
+function Generate-MobileConfig {
+    $out_file = Join-Path $OUT_DIR "${INITIALS}_claude.mobileconfig"
+    if (-not (Test-Path $MOBILECONFIG_TEMPLATE)) {
+        Write-Warning "Error: template not found at $MOBILECONFIG_TEMPLATE"
+        return
+    }
+
+    $content = Get-Content $MOBILECONFIG_TEMPLATE -Raw
+    $content = $content.Replace('<AIRIA-AI-GATEWAY>', $AIRIA_AI_GATEWAY)
+    $content = $content.Replace('<USER-API-KEY>', $USER_API_KEY)
+    $content = $content.Replace('<OTLP-ENDPOINT>', $OTLP_ENDPOINT_BASE)
+    $content = $content.Replace('<OTLP-API-KEY>', $OTLP_API_KEY)
+    $content = $content.Replace('<USER-EMAIL>', $USER_EMAIL)
+    $content = $content.Replace('[{"name":"<MCP-SERVER-NAME>","transport":"http","url":"<MCP-URL>","oauth":{"mode":"dcr"}}]', $MCP_ARRAY_PLAIN)
+
+    Set-Content $out_file $content
+    Write-Host "Created: $out_file"
+}
+
+function Generate-Reg {
+    $out_file = Join-Path $OUT_DIR "${INITIALS}_claude.reg"
+    if (-not (Test-Path $REG_TEMPLATE)) {
+        Write-Warning "Error: template not found at $REG_TEMPLATE"
+        return
+    }
+
+    if ($MCP_ENABLED) {
+        $mcpArrayEscaped = '[{\"name\":\"' + $MCP_NAME + '\",\"transport\":\"http\",\"url\":\"' + $MCP_URL + '\",\"oauth\":{\"mode\":\"dcr\"}}]'
+    } else {
+        $mcpArrayEscaped = '[]'
+    }
+
+    $content = Get-Content $REG_TEMPLATE -Raw
+    $content = $content.Replace('<AIRIA-AI-GATEWAY>', $AIRIA_AI_GATEWAY)
+    $content = $content.Replace('<USER-API-KEY>', $USER_API_KEY)
+    $content = $content.Replace('<OTLP-ENDPOINT>', $OTLP_ENDPOINT_BASE)
+    $content = $content.Replace('<OTLP-API-KEY>', $OTLP_API_KEY)
+    $content = $content.Replace('<USER-EMAIL>', $USER_EMAIL)
+    $content = $content.Replace('[{\"name\":\"<MCP-SERVER-NAME>\",\"transport\":\"http\",\"url\":\"<MCP-URL>\",\"oauth\":{\"mode\":\"dcr\"}}]', $mcpArrayEscaped)
+
+    # Ensure standard Windows Registry UTF-16LE (with BOM) formatting
+    [System.IO.File]::WriteAllText($out_file, $content, [System.Text.Encoding]::Unicode)
+    Write-Host "Created: $out_file"
+}
+
+switch ($PLATFORM_CHOICE) {
+    "1" { Generate-Reg }
+    "2" { Generate-MobileConfig }
+    "3" { Generate-Reg; Generate-MobileConfig }
+    Default {
+        Write-Host "Error: invalid choice '$PLATFORM_CHOICE'." -ForegroundColor Red
+        Read-Host "Press Enter to exit"
+        Exit
+    }
+}
+
+Write-Host ""
+Write-Host "============================================================"
+Write-Host " Done."
+Write-Host " These file(s) contain live API keys - treat them like"
+Write-Host " passwords. Do not commit them to source control or share"
+Write-Host " them outside of delivering them to the intended user."
+Write-Host "============================================================"
+Read-Host "Press Enter to exit"

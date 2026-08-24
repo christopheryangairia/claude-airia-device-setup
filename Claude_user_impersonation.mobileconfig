@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+	<dict>
+		<key>PayloadContent</key>
+		<array>
+			<dict>
+				<key>PayloadType</key>
+				<string>com.anthropic.claudefordesktop</string>
+				<key>PayloadIdentifier</key>
+				<string>com.anthropic.claudefordesktop.settings</string>
+				<key>PayloadUUID</key>
+				<string>D18C748A-DDF1-4B78-9DE7-64B7F1E77E62</string>
+				<key>PayloadVersion</key>
+				<integer>1</integer>
+				<key>PayloadDisplayName</key>
+				<string>Claude Desktop</string>
+				<key>inferenceGatewayBaseUrl</key>
+				<string><AIRIA-AI-GATEWAY>/anthropic</string>
+				<key>inferenceCustomHeaders</key>
+				<string>{"x-airia-key":"<AIRIA-GATEWAY-KEY>"}</string>
+				<key>inferenceGatewayApiKey</key>
+				<string><CLAUDE-LONGLIVED-TOKEN></string>
+				<key>inferenceGatewayAuthScheme</key>
+				<string>bearer</string>
+				<key>otlpEndpoint</key>
+				<string><OTLP-ENDPOINT>/v1/ClaudeCodeOtelIngest/ingest</string>
+				<key>otlpProtocol</key>
+				<string>http/json</string>
+				<key>otlpHeaders</key>
+				<string>{"X-API-KEY":"<OTLP-API-KEY>"}</string>
+				<key>otlpResourceAttributes</key>
+				<string>{"airia.user-email":"<USER-EMAIL>"}</string>
+				<key>otlpContentCapture</key>
+				<string>["userPrompts","assistantResponses","toolDetails","toolContent","rawApiBodies"]</string>
+				<key>chatTabEnabled</key>
+				<true/>
+				<key>chatAdvancedFileAnalysisEnabled</key>
+				<true/>
+				<key>inferenceModels</key>
+				<string><MODELS-JSON></string>
+				<key>managedMcpServers</key>
+				<string>[{"name":"<MCP-SERVER-NAME>","transport":"http","url":"<MCP-URL>","oauth":{"mode":"dcr"}}]</string>
+				<key>coworkEgressAllowedHosts</key>
+				<string>["*"]</string>
+				<key>disableDeploymentModeChooser</key>
+				<true/>
+				<key>inferenceProvider</key>
+				<string>gateway</string>
+				<key>inferenceCredentialKind</key>
+				<string>static</string>
+			</dict>
+		</array>
+		<key>PayloadDisplayName</key>
+		<string>Claude Desktop Third-Party Inference (User Impersonation)</string>
+		<key>PayloadIdentifier</key>
+		<string>com.anthropic.claudefordesktop.profile</string>
+		<key>PayloadType</key>
+		<string>Configuration</string>
+		<key>PayloadUUID</key>
+		<string>8F2AAF3B-30F0-4B0F-9895-4E6D2FEDBFC0</string>
+		<key>PayloadVersion</key>
+		<integer>1</integer>
+		<key>PayloadScope</key>
+		<string>User</string>
+	</dict>
+</plist>

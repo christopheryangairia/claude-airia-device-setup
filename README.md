@@ -13,6 +13,12 @@ running this from:
 - `setup_claude.ps1` — PowerShell (Windows). `run.bat` is a double-clickable
   launcher for this script.
 
+This is the **default setup** — the Airia-minted gateway key does all the
+authenticating, and Claude Desktop auto-discovers models. There is a second,
+separate setup for **User Impersonation** mode — see [Section 7](#7-user-impersonation-variant)
+below — where the *user's own* Anthropic plan subscription gets billed
+instead of an Airia-side key.
+
 > Note: `symmlink-plugins.sh` is a separate, unrelated utility for symlinking
 > a plugins folder from OneDrive and is not covered by this README.
 
@@ -204,3 +210,85 @@ to `grep`/`cut` for parsing the API response if `jq` isn't installed.
 - **Region wasn't detected correctly** — This only matters for the
   *suggested* Gateway URL; you can always type the real one at that prompt
   regardless of what region was detected.
+
+---
+
+## 7. User Impersonation variant
+
+Everything above describes the **default** setup, where an Airia-minted
+gateway key (`inferenceGatewayApiKey`) authenticates every request and Claude
+Desktop auto-discovers available models.
+
+**User Impersonation** is a different mode: the *end user's own* Anthropic
+plan subscription (Pro/Max/Team/Enterprise) gets billed for inference
+instead of an Airia-side key, while Airia stays in the request path for
+routing, logging, and model allow-listing. Full background and the
+manual/UI steps (mint the token, enable Developer Mode, etc.) live in
+`Claude Desktop via Airia Gateway – Formatted PDF.pdf` in this folder.
+
+Two credentials are always in play in this mode, and — unlike the default
+setup — they go in **different** places:
+
+| Credential | Format | Goes in | Sent as |
+|---|---|---|---|
+| The user's own Anthropic OAuth token | `sk-ant-oat01-...` | `inferenceGatewayApiKey` | `Authorization: Bearer` |
+| Airia-issued gateway key (same kind minted by the default flow) | Airia-issued (`agk-...`) | `inferenceCustomHeaders` → `x-airia-key` | custom header |
+
+Mixing these up is the #1 failure mode (401 "Invalid API key") — see the
+Troubleshooting table in the PDF.
+
+### Files
+
+- `Claude_user_impersonation.mobileconfig` / `Claude_user_impersonation.reg`
+  — placeholder templates for this mode (parallel to `Claude.mobileconfig` /
+  `Claude.reg`).
+- `setup_claude_user_impersonation.sh` — bash (macOS / Linux / WSL / Git Bash)
+- `setup_claude_user_impersonation.ps1` — PowerShell (Windows).
+  `run_user_impersonation.bat` is a double-clickable launcher for this script.
+
+### What's different from the default script
+
+1. **Airia gateway key still gets minted the same way** (`POST
+   /v1/GatewayApiKey` using `MINT_API_KEY` + `GATEWAY_CONFIGURATION_ID` from
+   `.env` — same admin values as the default script), but the result is
+   written into the `x-airia-key` custom header instead of
+   `inferenceGatewayApiKey`.
+2. **New prompt: the user's Claude long-lived token.** The script cannot
+   mint this — it requires an interactive local browser OAuth flow. The end
+   user must run `claude setup-token` themselves on their own machine (not
+   over plain SSH — the OAuth callback targets `localhost`), approve in the
+   browser while signed into the correct plan account, and paste the
+   resulting `sk-ant-oat01-...` token into the script's prompt. This becomes
+   `inferenceGatewayApiKey`.
+3. **`inferenceGatewayAuthScheme` is fixed to `"bearer"`** in the template
+   (not a placeholder) — required so the token above travels as
+   `Authorization: Bearer` rather than `x-api-key`.
+4. **New step: manual model list.** Since model discovery doesn't work the
+   same way in this mode, the script loops asking for model names one at a
+   time (e.g. `claude-sonnet-4-6`, an Opus model, and `claude-haiku-4-5`,
+   which is required for background tasks) plus whether each supports 1M
+   context (`supports1m`, written as an explicit `true`/`false`). These
+   must match the Allowed Models list configured on the Airia gateway side
+   (an empty allow-list there means "allow all"). The script shows the
+   accumulated list and asks for a final confirmation (with the option to
+   add more or remove the last entry) before writing it into
+   `inferenceModels`.
+5. Everything else — BASE_URL/region detection, AI Gateway URL, user email,
+   OTLP endpoint/key, optional MCP server, output platform choice — works
+   identically to `setup_claude.sh`/`.ps1`.
+
+### Placeholder reference (impersonation templates)
+
+| Placeholder | Filled with | Purpose |
+|---|---|---|
+| `<AIRIA-AI-GATEWAY>` | The AI Gateway URL | Same as the default template — `inferenceGatewayBaseUrl` with `/anthropic` appended. |
+| `<AIRIA-GATEWAY-KEY>` | The key minted from `/v1/GatewayApiKey` in step 4 | Written into `inferenceCustomHeaders` as `{"x-airia-key":"..."}`. Authenticates to Airia / identifies the tenant config. |
+| `<CLAUDE-LONGLIVED-TOKEN>` | The user's own `sk-ant-oat01-...` token, pasted in step 5 | Written into `inferenceGatewayApiKey`. Authenticates to Anthropic and bills the user's own plan seat. Sent as `Authorization: Bearer` (see `inferenceGatewayAuthScheme`, fixed to `"bearer"` in the template). |
+| `<OTLP-ENDPOINT>` / `<OTLP-API-KEY>` / `<USER-EMAIL>` | Same as the default flow | Telemetry wiring — unchanged from `setup_claude.sh`/`.ps1`. |
+| `<MODELS-JSON>` | The confirmed model list from step 8, e.g. `[{"name":"claude-sonnet-4-6","supports1m":false},{"name":"claude-haiku-4-5","supports1m":false}]` | Written into `inferenceModels`. Must match the Allowed Models list on the Airia gateway side. |
+| `<MCP-SERVER-NAME>` / `<MCP-URL>` | Same as the default flow | `managedMcpServers`, or `[]` if declined. |
+
+Output files land in `./generated/` as `<INITIALS>_claude_impersonation.reg`
+/ `<INITIALS>_claude_impersonation.mobileconfig` — same live-credential
+handling rules apply (never commit, treat like passwords, deliver only to
+the intended user).

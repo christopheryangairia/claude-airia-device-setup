@@ -6,18 +6,45 @@ Desktop at your organization's Airia inference gateway, wires up OTLP
 telemetry, and optionally registers a managed MCP server — all for one
 specific end user.
 
-There are two equivalent scripts, so use whichever matches the machine you're
-running this from:
+## Quick start — pick a mode, one entry point
 
-- `setup_claude_gateway.sh` — bash (macOS / Linux / WSL / Git Bash)
-- `setup_claude_gateway.ps1` — PowerShell (Windows). `run_gateway.bat` is a
+Run whichever matches the machine you're on, from the project root:
+
+- `./setup_claude.sh` — bash (macOS / Linux / WSL / Git Bash)
+- `.\setup_claude.ps1` — PowerShell (Windows). `run.bat` is a
   double-clickable launcher for this script.
 
-This is the **default setup** — the Airia-minted gateway key does all the
-authenticating, and Claude Desktop auto-discovers models. There is a second,
-separate setup for **User Impersonation** mode — see [Section 7](#7-user-impersonation-variant)
-below — where the *user's own* Anthropic plan subscription gets billed
-instead of an Airia-side key.
+Either one asks a single question — **Gateway** (Airia-minted universal key;
+Claude Desktop auto-discovers models) or **OAuth Passthrough / User
+Impersonation** (bills the *user's own* Anthropic plan subscription instead
+of an Airia-side key) — then hands off to the matching script under
+`scripts/`. Everything from that point on (region, email, existing-key
+checks, OTLP, MCP, output format) is identical to running that script
+directly; see [Section 7](#7-user-impersonation-variant) for what's
+different about Impersonation mode specifically.
+
+## Folder layout
+
+```
+.
+├── setup_claude.sh / setup_claude.ps1   ← start here: mode picker
+├── run.bat                              ← double-click launcher for setup_claude.ps1
+├── .env / .env_sample                   ← admin config, shared by every script below
+├── scripts/                             ← the actual per-mode setup scripts
+│   ├── setup_claude_gateway.sh / .ps1
+│   ├── setup_claude_user_impersonation.sh / .ps1
+│   └── run_gateway.bat / run_user_impersonation.bat  ← direct-mode launchers
+├── templates/                           ← .reg / .mobileconfig templates with placeholders
+│   ├── Claude.reg / Claude.mobileconfig
+│   └── Claude_user_impersonation.reg / Claude_user_impersonation.mobileconfig
+├── generated/                           ← output lands here regardless of entry point
+└── docs/                                ← background PDF, etc.
+```
+
+You can still run `scripts/setup_claude_gateway.sh` (or the impersonation
+variant) directly if you already know which mode you want — the mode picker
+is purely a convenience wrapper and doesn't change any of the underlying
+behavior documented below.
 
 > Note: `symmlink-plugins.sh` is a separate, unrelated utility for symlinking
 > a plugins folder from OneDrive and is not covered by this README.
@@ -31,8 +58,9 @@ environment/organization** before handing the script to anyone. These are not
 per-user values — the script will still ask each individual user for their
 own email, region, etc. separately.
 
-**Recommended: use a `.env` file.** Copy `.env_sample` to `.env` in this same
-folder and fill in your values:
+**Recommended: use a `.env` file.** Copy `.env_sample` to `.env` in the
+**project root** (next to `setup_claude.sh`/`.ps1`, not inside `scripts/`)
+and fill in your values:
 
 ```bash
 cp .env_sample .env
@@ -42,21 +70,29 @@ cp .env_sample .env
 # .env
 MINT_API_KEY="ak-..."
 GATEWAY_CONFIGURATION_ID="2d25bdf7-..."
+
+# Optional overrides — see the table below. Uncomment only if you need
+# something other than the defaults.
+# KEY_TYPE="User"
+# ENABLED="true"
 ```
 
-Both `setup_claude_gateway.sh` and `setup_claude_gateway.ps1` automatically load `.env` from
-the script's own directory if it exists (you'll see a `Loading environment
-from ...` line when they do), and export the values into the process
-environment before anything else runs. Values may optionally be wrapped in
-single or double quotes — both scripts strip them correctly. Trailing `#
-comments` on a line are also stripped. `.env` is already listed in
-`.gitignore`, so it won't get committed by accident.
+All four scripts under `scripts/` (`setup_claude_gateway.sh`/`.ps1` and
+`setup_claude_user_impersonation.sh`/`.ps1`) automatically load `.env` from
+the project root if it exists (you'll see a `Loading environment from ...`
+line when they do), and export the values into the process environment
+before anything else runs — this works the same whether you launched them
+directly or via the `setup_claude.sh`/`.ps1` mode picker at the root. Values
+may optionally be wrapped in single or double quotes — all scripts strip
+them correctly. Trailing `# comments` on a line are also stripped. `.env` is
+already listed in `.gitignore`, so it won't get committed by accident.
 
 If you'd rather not use a `.env` file, you can instead hardcode the values
-directly in the small constants block near the top of each script:
+directly in the small constants block near the top of each script under
+`scripts/`:
 
 ```bash
-# setup_claude_gateway.sh
+# scripts/setup_claude_gateway.sh
 MINT_API_KEY=""
 GATEWAY_CONFIGURATION_ID=""
 KEY_TYPE="User"
@@ -64,7 +100,7 @@ ENABLED="true"
 ```
 
 ```powershell
-# setup_claude_gateway.ps1
+# scripts/setup_claude_gateway.ps1
 $MINT_API_KEY = if ($env:MINT_API_KEY) { $env:MINT_API_KEY } else { "" }
 $GATEWAY_CONFIGURATION_ID = if ($env:GATEWAY_CONFIGURATION_ID) { $env:GATEWAY_CONFIGURATION_ID } else { "" }
 $KEY_TYPE = "User"
@@ -76,12 +112,12 @@ A value set directly in the script's constants block only takes effect if
 environment, e.g. `export MINT_API_KEY=...` before running the script) wins
 if both are present.
 
-| Constant | What it is | Where to get it |
+| Env var | What it is | Where to get it |
 |---|---|---|
-| `MINT_API_KEY` | An **admin-level** Airia API key with permission to create new Gateway API keys via the `/v1/GatewayApiKey` endpoint. This is the credential the script authenticates itself with — it is not the key that ends up in the generated config file. By default it is also reused as the OTLP telemetry key (see `<OTLP-API-KEY>` below), unless the person running the script chooses to supply a different one. | Airia Platform → Gateway settings → API Keys (admin/org-owner access), or ask your Airia Admin. |
-| `GATEWAY_CONFIGURATION_ID` | The ID of the specific Gateway Configuration in Airia that the newly minted user key should belong to. Every key minted by this script is scoped to this configuration. | Airia Platform → Gateway → the specific Gateway Configuration's details page. Ask your Admin if you don't see it. |
-| `KEY_TYPE` | The type of key to request from Airia when minting. `"User"` mints a personal, per-person key (this is what the script is designed around — each run mints one key for one email). Other values may be supported by your Airia environment (e.g. a service/team-level key type) but changing this changes what kind of key gets generated. | Leave as `"User"` unless your Admin tells you otherwise. |
-| `ENABLED` | Whether the newly minted key should be **active immediately** on the gateway (`true`) or created in a disabled state (`false`) so an admin has to flip it on later. This does not affect anything already in the generated config file — it only affects whether the key actually works on Airia's side the moment it's created. | Leave as `true` for normal onboarding. Set to `false` if your process requires an admin to explicitly approve/enable new keys before they're usable. |
+| `MINT_API_KEY` | **Required.** An **admin-level** Airia API key with permission to create new Gateway API keys via the `/v1/GatewayApiKey` endpoint. This is the credential the script authenticates itself with — it is not the key that ends up in the generated config file. By default it is also reused as the OTLP telemetry key (see `<OTLP-API-KEY>` below), unless the person running the script chooses to supply a different one. | Airia Platform → Gateway settings → API Keys (admin/org-owner access), or ask your Airia Admin. |
+| `GATEWAY_CONFIGURATION_ID` | **Required.** The ID of the specific Gateway Configuration in Airia that the newly minted user key should belong to. Every key minted by this script is scoped to this configuration. | Airia Platform → Gateway → the specific Gateway Configuration's details page. Ask your Admin if you don't see it. |
+| `KEY_TYPE` | Optional (defaults to `"User"`). The type of key to request from Airia when minting. `"User"` mints a personal, per-person key (this is what the script is designed around — each run mints one key for one email). Other values may be supported by your Airia environment (e.g. a service/team-level key type) but changing this changes what kind of key gets generated. | Leave unset/`"User"` unless your Admin tells you otherwise. |
+| `ENABLED` | Optional (defaults to `"true"`). Whether the newly minted key should be **active immediately** on the gateway (`true`) or created in a disabled state (`false`) so an admin has to flip it on later. This does not affect anything already in the generated config file — it only affects whether the key actually works on Airia's side the moment it's created. | Leave unset/`"true"` for normal onboarding. Set to `false` if your process requires an admin to explicitly approve/enable new keys before they're usable. |
 
 If your organization only has one Airia gateway configuration, you'll set
 these once and never touch them again. If you support multiple environments
@@ -168,9 +204,9 @@ are derived from the user's email (and can be overridden).
 
 ## 3. Placeholder reference
 
-Both `Claude.reg` and `Claude.mobileconfig` are templates containing the same
-set of placeholders. The scripts fill in every one of these before writing
-the final file to `./generated/`.
+Both `templates/Claude.reg` and `templates/Claude.mobileconfig` are templates
+containing the same set of placeholders. The scripts fill in every one of
+these before writing the final file to `./generated/`.
 
 | Placeholder | Filled with | Purpose |
 |---|---|---|
@@ -186,9 +222,9 @@ values baked into the templates themselves and aren't touched by the script:
 
 - `otlpProtocol` (`http/json`), `otlpContentCapture` (which content types get
   captured), `chatTabEnabled`, `coworkEgressAllowedHosts`, `inferenceProvider`
-  (`gateway`), and `inferenceCredentialKind` (`static`). Edit `Claude.reg` /
-  `Claude.mobileconfig` directly if you need to change any of these defaults
-  for your organization.
+  (`gateway`), and `inferenceCredentialKind` (`static`). Edit
+  `templates/Claude.reg` / `templates/Claude.mobileconfig` directly if you
+  need to change any of these defaults for your organization.
 
 ---
 
@@ -214,19 +250,19 @@ passwords:
 
 ## 5. Requirements
 
-**`setup_claude_gateway.sh`**: `bash`, `curl`, `perl` (used for safe literal
-string substitution), and `iconv` (used to safely edit the UTF‑16 `.reg`
-file without corrupting its encoding). `jq` is strongly recommended — it's
-used to parse the `/v1/Users` and `/v1/GatewayConfiguration` responses for
-the duplicate-key and access checks (steps 4/5/7 above). If `jq` isn't
+**`scripts/setup_claude_gateway.sh`**: `bash`, `curl`, `perl` (used for safe
+literal string substitution), and `iconv` (used to safely edit the UTF‑16
+`.reg` file without corrupting its encoding). `jq` is strongly recommended —
+it's used to parse the `/v1/Users` and `/v1/GatewayConfiguration` responses
+for the duplicate-key and access checks (steps 4/5/7 above). If `jq` isn't
 installed, the script falls back to `python3` for those same lookups; if
 neither is available, it falls back further to `grep`/`cut` for the basic
 API key extraction and simply skips the automatic user/key matching (you'll
 always be prompted to confirm access and mint a fresh key manually).
 
-**`setup_claude_gateway.ps1`**: Windows PowerShell with internet access to
-reach the `BASE_URL` you provide (uses `Invoke-RestMethod`, which is built
-in — no extra dependency needed for the equivalent checks).
+**`scripts/setup_claude_gateway.ps1`**: Windows PowerShell with internet
+access to reach the `BASE_URL` you provide (uses `Invoke-RestMethod`, which
+is built in — no extra dependency needed for the equivalent checks).
 
 ---
 
@@ -239,9 +275,9 @@ in — no extra dependency needed for the equivalent checks).
   check there's no stray whitespace or mismatched quote at the end of a line.
 - **"Warning: MINT_API_KEY and/or GATEWAY_CONFIGURATION_ID are not set"**,
   or the script otherwise seems to ignore your `.env` — confirm the file is
-  literally named `.env` and sits next to `setup_claude_gateway.sh` / `setup_claude_gateway.ps1`
-  (not in a parent folder), and that you don't still have `.env_sample`'s
-  placeholder values in place.
+  literally named `.env` and sits in the **project root** (next to
+  `setup_claude.sh`/`.ps1`, *not* inside `scripts/`), and that you don't
+  still have `.env_sample`'s placeholder values in place.
 - **"iconv is required..."** — Install `iconv` (usually part of `glibc` /
   available via your package manager) before generating a `.reg` file on
   bash.
@@ -266,11 +302,12 @@ in — no extra dependency needed for the equivalent checks).
   can't resolve a platform user id and skips the duplicate-key and
   access-list checks. This usually means the person hasn't been invited to
   the tenant yet — invite them first if you expect these checks to run.
-- **"Access count did not increase" / stuck in the access-confirmation
-  loop** — the script re-checks `GET /v1/GatewayConfiguration/{id}/users-access`
-  after you answer `y`; if the user still isn't listed, double-check you
-  granted access to the *email you typed*, not a different account, via the
-  `Secure > Gateway` link the script prints.
+- **"Still not finding '\<email\>' in the access list" / stuck in the
+  access-confirmation loop** — the script re-checks
+  `GET /v1/GatewayConfiguration/{id}/users-access` after you answer `y`; if
+  the user still isn't listed, double-check you granted access to the
+  *email you typed*, not a different account, via the `Secure > Gateway`
+  link the script prints.
 
 ---
 
@@ -285,7 +322,7 @@ plan subscription (Pro/Max/Team/Enterprise) gets billed for inference
 instead of an Airia-side key, while Airia stays in the request path for
 routing, logging, and model allow-listing. Full background and the
 manual/UI steps (mint the token, enable Developer Mode, etc.) live in
-`Claude Desktop via Airia Gateway – Formatted PDF.pdf` in this folder.
+`docs/Claude Desktop via Airia Gateway – Formatted PDF.pdf`.
 
 Two credentials are always in play in this mode, and — unlike the default
 setup — they go in **different** places:
@@ -300,12 +337,15 @@ Troubleshooting table in the PDF.
 
 ### Files
 
-- `Claude_user_impersonation.mobileconfig` / `Claude_user_impersonation.reg`
-  — placeholder templates for this mode (parallel to `Claude.mobileconfig` /
-  `Claude.reg`).
-- `setup_claude_user_impersonation.sh` — bash (macOS / Linux / WSL / Git Bash)
-- `setup_claude_user_impersonation.ps1` — PowerShell (Windows).
-  `run_user_impersonation.bat` is a double-clickable launcher for this script.
+- `templates/Claude_user_impersonation.mobileconfig` /
+  `templates/Claude_user_impersonation.reg` — placeholder templates for this
+  mode (parallel to `templates/Claude.mobileconfig` / `templates/Claude.reg`).
+- `scripts/setup_claude_user_impersonation.sh` — bash (macOS / Linux / WSL /
+  Git Bash)
+- `scripts/setup_claude_user_impersonation.ps1` — PowerShell (Windows).
+  `scripts/run_user_impersonation.bat` is a double-clickable launcher for
+  this script. Or just run `setup_claude.sh`/`.ps1` from the project root
+  and pick option 2.
 
 ### What's different from the default script
 
@@ -336,7 +376,7 @@ Troubleshooting table in the PDF.
    `inferenceModels`.
 5. Everything else — BASE_URL/region detection, AI Gateway URL, user email,
    OTLP endpoint/key, optional MCP server, output platform choice — works
-   identically to `setup_claude_gateway.sh`/`.ps1`. That includes the same
+   identically to `scripts/setup_claude_gateway.sh`/`.ps1`. That includes the same
    pre-mint checks described in [Section 2](#2-what-the-script-asks-you-step-by-step):
    resolving the email to a platform user id, checking for and optionally
    reusing an existing enabled gateway key (the one that ends up in
@@ -350,7 +390,7 @@ Troubleshooting table in the PDF.
 | `<AIRIA-AI-GATEWAY>` | The AI Gateway URL | Same as the default template — `inferenceGatewayBaseUrl` with `/anthropic` appended. |
 | `<AIRIA-GATEWAY-KEY>` | The gateway key from the key acquisition step — reused from an existing key or freshly minted via `/v1/GatewayApiKey` (same logic as the default flow's step 5/6) | Written into `inferenceCustomHeaders` as `{"x-airia-key":"..."}`. Authenticates to Airia / identifies the tenant config. |
 | `<CLAUDE-LONGLIVED-TOKEN>` | The user's own `sk-ant-oat01-...` token, pasted at the "Claude long-lived token" prompt ("What's different" item 2 above) | Written into `inferenceGatewayApiKey`. Authenticates to Anthropic and bills the user's own plan seat. Sent as `Authorization: Bearer` (see `inferenceGatewayAuthScheme`, fixed to `"bearer"` in the template). |
-| `<OTLP-ENDPOINT>` / `<OTLP-API-KEY>` / `<USER-EMAIL>` | Same as the default flow | Telemetry wiring — unchanged from `setup_claude_gateway.sh`/`.ps1`. |
+| `<OTLP-ENDPOINT>` / `<OTLP-API-KEY>` / `<USER-EMAIL>` | Same as the default flow | Telemetry wiring — unchanged from `scripts/setup_claude_gateway.sh`/`.ps1`. |
 | `<MODELS-JSON>` | The confirmed model list from the manual model list step ("What's different" item 4 above), e.g. `[{"name":"claude-sonnet-4-6","supports1m":false},{"name":"claude-haiku-4-5","supports1m":false}]` | Written into `inferenceModels`. Must match the Allowed Models list on the Airia gateway side. |
 | `<MCP-SERVER-NAME>` / `<MCP-URL>` | Same as the default flow | `managedMcpServers`, or `[]` if declined. |
 

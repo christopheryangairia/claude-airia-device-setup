@@ -1,47 +1,23 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Airia — Claude Desktop Gateway Setup (User Impersonation)
+# Airia — Claude Desktop Gateway Setup
 #
 # Purpose:
 #   This script sets up Claude Desktop to run through the Airia inference
-#   gateway in "User Impersonation" mode for a specific user — i.e. the
-#   user's own Anthropic plan subscription (Pro/Max/Team/Enterprise) is
-#   billed, and Airia stays in the request path only for routing, logging,
-#   and model allow-listing. See "Claude Desktop via Airia Gateway – Formatted
-#   PDF.pdf" for the full background.
-#
-#   This is DIFFERENT from setup_claude.sh (the default gateway-key flow):
-#     - The Airia-issued gateway key (minted the same way as the default
-#       flow, via /v1/GatewayApiKey) goes into the `x-airia-key` CUSTOM
-#       HEADER, not into inferenceGatewayApiKey.
-#     - inferenceGatewayApiKey instead holds the USER'S OWN long-lived
-#       Anthropic OAuth token (sk-ant-oat01-...), which the user must mint
-#       themselves by running `claude setup-token` locally (an interactive
-#       browser OAuth flow this script cannot automate) and paste in here.
-#     - Models are NOT auto-discovered — the user must manually enter the
-#       model names to allow (matching the Allowed Models list configured
-#       on the Airia gateway side), plus whether each supports 1M context.
-#
-#   Steps:
+#   gateway for a specific user. It will:
 #     1. Ask for / infer the Airia region (from a BASE_URL like the one in
 #        run.sh, e.g. https://sg01.api.airia.ai -> region "sg01")
 #     2. Ask for the AI Gateway URL (suggesting the standard pattern for the
 #        detected region: https://<region>.gateway.airia.ai/)
 #     3. Ask for the user's email address
 #     4. Request a personal Gateway API key from Airia (User key type) using
-#        that email — this becomes the `x-airia-key` custom header value
-#     5. Ask for the user's Claude long-lived token (sk-ant-oat01-...,
-#        minted locally via `claude setup-token`) — this becomes
-#        inferenceGatewayApiKey
-#     6. Derive the OTLP endpoint from the same BASE_URL, and ask for the
+#        that email
+#     5. Derive the OTLP endpoint from the same BASE_URL, and ask for the
 #        OTLP API key (X-API-Key header used for telemetry ingestion)
-#     7. Optionally ask for an MCP server name + URL to manage
-#     8. Ask the user to manually enter the list of discovered/allowed
-#        models (name + whether it supports 1M context), one at a time,
-#        then confirm the final list
-#     9. Fill in the Windows (.reg) and/or macOS (.mobileconfig) config
+#     6. Optionally ask for an MCP server name + URL to manage
+#     7. Fill in the Windows (.reg) and/or macOS (.mobileconfig) config
 #        template with all of the above
-#     10. Save the finished, ready-to-install file(s) to ./generated/
+#     8. Save the finished, ready-to-install file(s) to ./generated/
 #
 # Requires: bash, curl, perl. jq is optional but recommended (falls back to
 #           grep). iconv is required to safely edit the UTF-16 .reg file.
@@ -50,17 +26,16 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-OUT_DIR="${SCRIPT_DIR}/generated"
+ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+OUT_DIR="${ROOT_DIR}/generated"
 
-REG_TEMPLATE="${SCRIPT_DIR}/Claude_user_impersonation.reg"
-MOBILECONFIG_TEMPLATE="${SCRIPT_DIR}/Claude_user_impersonation.mobileconfig"
+REG_TEMPLATE="${ROOT_DIR}/templates/Claude.reg"
+MOBILECONFIG_TEMPLATE="${ROOT_DIR}/templates/Claude.mobileconfig"
 
 # -----------------------------------------------------------------------------
-# Fixed admin credentials used only to mint the Airia gateway key that goes
-# into the x-airia-key custom header. Same mechanism as setup_claude.sh — the
-# gateway configuration behind BASE_URL/GATEWAY_CONFIGURATION_ID must have AI
-# Service Authentication set to "User Impersonation" on the Airia side (that
-# is configured in Airia, not here).
+# Fixed admin credentials used only to mint a personal user API key.
+# These are tied to a specific Airia gateway configuration — update them if
+# your organization uses a different admin key / configuration id.
 # -----------------------------------------------------------------------------
 MINT_API_KEY=""
 GATEWAY_CONFIGURATION_ID=""
@@ -74,7 +49,7 @@ ENABLED="true"
 # around values (single or double) are removed. Parsed values are exported
 # into this process environment so the rest of the script can read them via
 # $MINT_API_KEY etc.
-ENV_FILE="${SCRIPT_DIR}/.env"
+ENV_FILE="${ROOT_DIR}/.env"
 if [[ -f "${ENV_FILE}" ]]; then
   echo "Loading environment from ${ENV_FILE}"
   while IFS= read -r _line || [[ -n "$_line" ]]; do
@@ -107,18 +82,17 @@ GATEWAY_CONFIGURATION_ID="${GATEWAY_CONFIGURATION_ID:-}"
 
 if [[ -z "${MINT_API_KEY}" || -z "${GATEWAY_CONFIGURATION_ID}" ]]; then
   echo "Warning: MINT_API_KEY and/or GATEWAY_CONFIGURATION_ID are not set." >&2
-  echo "Create a .env file next to setup_claude_user_impersonation.sh with:" >&2
+  echo "Create a .env file in the project root with:" >&2
   echo "  MINT_API_KEY=ak-..." >&2
   echo "  GATEWAY_CONFIGURATION_ID=..." >&2
 fi
 
 echo "============================================================"
-echo " Claude Desktop — Airia Gateway Setup (User Impersonation)"
+echo " Claude Desktop — Airia Gateway Setup"
 echo "============================================================"
-echo "This will request a personal Airia gateway key (for the x-airia-key"
-echo "header) and generate a ready-to-install Claude Desktop config file"
-echo "(Windows .reg and/or macOS .mobileconfig) wired for User Impersonation"
-echo "mode — the user's own Anthropic plan subscription is billed."
+echo "This will request a personal Airia gateway API key for a user"
+echo "and generate a ready-to-install Claude Desktop config file"
+echo "(Windows .reg and/or macOS .mobileconfig) with that key baked in."
 echo ""
 
 # -----------------------------------------------------------------------------
@@ -162,8 +136,7 @@ fi
 # 2. Ask for the AI Gateway URL
 # -----------------------------------------------------------------------------
 echo "Go to the Airia Platform > Gateway settings to retrieve your AI Gateway"
-echo "URL. If you don't have access, ask your Admin. This gateway config must"
-echo "have AI Service Authentication set to 'User Impersonation'."
+echo "URL. If you don't have access, ask your Admin."
 if [[ -n "${REGION}" ]]; then
   SUGGESTED_GATEWAY="https://${REGION}.gateway.airia.ai"
   echo "Based on region '${REGION}', it is likely: ${SUGGESTED_GATEWAY}/"
@@ -285,7 +258,7 @@ echo ""
 #     unreliable (404s on some otherwise-valid, enabled keys) — if it fails
 #     we fall back to minting a new key rather than blocking.
 # -----------------------------------------------------------------------------
-AIRIA_GATEWAY_KEY=""
+USER_API_KEY=""
 if [[ -n "${GATEWAY_USER_ID}" ]]; then
   echo "Checking for existing gateway API keys for ${USER_EMAIL}..."
   CONFIG_RESPONSE=$(curl --silent --show-error \
@@ -332,13 +305,13 @@ for k in data.get('apiKeys', []):
         echo "The retrieved key value is masked/obfuscated: ${FETCHED_KEY}"
         read -rp "Paste the real key manually (or leave blank to create a new one instead): " MANUAL_KEY
         if [[ -n "${MANUAL_KEY}" ]]; then
-          AIRIA_GATEWAY_KEY="${MANUAL_KEY}"
+          USER_API_KEY="${MANUAL_KEY}"
           echo "Using manually entered key."
         else
           echo "No key entered — a new key will be created instead."
         fi
       elif [[ -n "${FETCHED_KEY}" ]]; then
-        AIRIA_GATEWAY_KEY="${FETCHED_KEY}"
+        USER_API_KEY="${FETCHED_KEY}"
         echo "Reusing existing gateway API key."
       else
         echo "Warning: could not retrieve the existing key's value via the API — a new key will be created instead." >&2
@@ -349,11 +322,10 @@ fi
 echo ""
 
 # -----------------------------------------------------------------------------
-# 4. Create the Airia gateway key (goes into the x-airia-key custom header),
-#    skipped if an existing key was reused above.
+# 4. Create the gateway API key (skipped if an existing key was reused above)
 # -----------------------------------------------------------------------------
-if [[ -z "${AIRIA_GATEWAY_KEY}" ]]; then
-  echo "Requesting Airia gateway key (for x-airia-key header) from Airia..."
+if [[ -z "${USER_API_KEY}" ]]; then
+  echo "Requesting gateway API key from Airia..."
 
   ENDPOINT="${BASE_URL}/v1/GatewayApiKey"
 
@@ -385,18 +357,18 @@ EOF
   fi
 
   if command -v jq &>/dev/null; then
-    AIRIA_GATEWAY_KEY=$(echo "${RESPONSE}" | jq -r '.apiKey // empty')
+    USER_API_KEY=$(echo "${RESPONSE}" | jq -r '.apiKey // empty')
   else
-    AIRIA_GATEWAY_KEY=$(echo "${RESPONSE}" | grep -o '"apiKey":"[^"]*"' | cut -d'"' -f4)
+    USER_API_KEY=$(echo "${RESPONSE}" | grep -o '"apiKey":"[^"]*"' | cut -d'"' -f4)
   fi
 
-  if [[ -z "${AIRIA_GATEWAY_KEY}" ]]; then
+  if [[ -z "${USER_API_KEY}" ]]; then
     echo "Error: could not extract apiKey from response." >&2
     echo "Response: ${RESPONSE}" >&2
     exit 1
   fi
 
-  echo "Airia gateway key created successfully (will be placed in x-airia-key)."
+  echo "API key created successfully."
 fi
 echo ""
 
@@ -452,40 +424,7 @@ fi
 echo ""
 
 # -----------------------------------------------------------------------------
-# 5. Ask for the user's Claude long-lived token (goes into
-#    inferenceGatewayApiKey, sent as Authorization: Bearer)
-# -----------------------------------------------------------------------------
-echo "------------------------------------------------------------"
-echo " Claude long-lived token (Anthropic OAuth token)"
-echo "------------------------------------------------------------"
-echo "This script cannot mint this token for you — it requires an interactive"
-echo "local browser OAuth flow. On the END USER's own machine (not over plain"
-echo "SSH — the OAuth callback targets localhost), have them run:"
-echo ""
-echo "    claude setup-token"
-echo ""
-echo "This opens claude.ai/oauth/authorize (scope: user:inference, PKCE flow)."
-echo "They must approve while signed in to the correct plan account"
-echo "(Pro/Max/Team/Enterprise). The CLI then prints a long-lived (~1 year)"
-echo "token that looks like: sk-ant-oat01-..."
-echo ""
-echo "Security note: treat this token like a password. Anyone holding it can"
-echo "consume the user's plan quota. Do not commit it to source control."
-echo ""
-read -rp "Paste the user's sk-ant-oat01-... token: " CLAUDE_LONGLIVED_TOKEN
-if [[ -z "${CLAUDE_LONGLIVED_TOKEN}" ]]; then
-  echo "Error: the Claude long-lived token is required." >&2
-  exit 1
-fi
-if [[ "${CLAUDE_LONGLIVED_TOKEN}" != sk-ant-oat01-* ]]; then
-  echo "Warning: this doesn't look like a sk-ant-oat01-... token. Continuing" >&2
-  echo "anyway, but double check you didn't paste the ?code=... value or the" >&2
-  echo "Airia gateway key by mistake." >&2
-fi
-echo ""
-
-# -----------------------------------------------------------------------------
-# 6. OTLP endpoint (derived from BASE_URL) + OTLP API key
+# 5. OTLP endpoint (derived from BASE_URL) + OTLP API key
 #    Defaults to the same admin key used to mint the gateway key (MINT_API_KEY)
 #    unless the user wants to provide a separate one for telemetry ingestion.
 # -----------------------------------------------------------------------------
@@ -506,7 +445,7 @@ fi
 echo ""
 
 # -----------------------------------------------------------------------------
-# 7. Optional MCP server
+# 6. Optional MCP server
 # -----------------------------------------------------------------------------
 MCP_ENABLED="false"
 MCP_NAME=""
@@ -524,85 +463,7 @@ fi
 echo ""
 
 # -----------------------------------------------------------------------------
-# 8. Manually entered model list (inferenceModels)
-#    User Impersonation does not auto-discover models — the models entered
-#    here must match the Allowed Models list configured on the Airia gateway
-#    side (an empty allow-list there means "allow all").
-# -----------------------------------------------------------------------------
-echo "------------------------------------------------------------"
-echo " Model list (inferenceModels)"
-echo "------------------------------------------------------------"
-echo "Enter the models Claude Desktop should offer. These must match the"
-echo "Allowed Models list configured on the Airia gateway side. Remember to"
-echo "include claude-haiku-4-5 (used for background tasks)."
-echo ""
-
-MODELS_JSON_ITEMS=()
-MODELS_SUMMARY=()
-while true; do
-  read -rp "Model name (e.g. claude-sonnet-4-6), or press Enter to stop adding models: " MODEL_NAME
-  if [[ -z "${MODEL_NAME}" ]]; then
-    if [[ ${#MODELS_JSON_ITEMS[@]} -eq 0 ]]; then
-      echo "You must enter at least one model." >&2
-      continue
-    fi
-    break
-  fi
-
-  read -rp "  Does '${MODEL_NAME}' support 1M context (supports1m)? [y/N]: " SUPPORTS_1M_CHOICE
-  if [[ "${SUPPORTS_1M_CHOICE}" =~ ^[Yy] ]]; then
-    SUPPORTS_1M="true"
-  else
-    SUPPORTS_1M="false"
-  fi
-
-  MODELS_JSON_ITEMS+=("{\"name\":\"${MODEL_NAME}\",\"supports1m\":${SUPPORTS_1M}}")
-  MODELS_SUMMARY+=("  - ${MODEL_NAME} (supports1m: ${SUPPORTS_1M})")
-  echo ""
-done
-
-echo "Current model list:"
-printf '%s\n' "${MODELS_SUMMARY[@]}"
-echo ""
-
-while true; do
-  read -rp "Confirm this is the final model list? [Y/n]: " CONFIRM_MODELS
-  if [[ -z "${CONFIRM_MODELS}" || "${CONFIRM_MODELS}" =~ ^[Yy] ]]; then
-    if [[ ${#MODELS_JSON_ITEMS[@]} -eq 0 ]]; then
-      echo "You must have at least one model before confirming." >&2
-      echo "" >&2
-    else
-      break
-    fi
-  fi
-
-  read -rp "Add another model? (leave blank to just remove the last one and re-confirm) Model name: " EXTRA_MODEL
-  if [[ -n "${EXTRA_MODEL}" ]]; then
-    read -rp "  Does '${EXTRA_MODEL}' support 1M context (supports1m)? [y/N]: " EXTRA_SUPPORTS_1M_CHOICE
-    if [[ "${EXTRA_SUPPORTS_1M_CHOICE}" =~ ^[Yy] ]]; then
-      EXTRA_SUPPORTS_1M="true"
-    else
-      EXTRA_SUPPORTS_1M="false"
-    fi
-    MODELS_JSON_ITEMS+=("{\"name\":\"${EXTRA_MODEL}\",\"supports1m\":${EXTRA_SUPPORTS_1M}}")
-    MODELS_SUMMARY+=("  - ${EXTRA_MODEL} (supports1m: ${EXTRA_SUPPORTS_1M})")
-  elif [[ ${#MODELS_JSON_ITEMS[@]} -gt 0 ]]; then
-    unset 'MODELS_JSON_ITEMS[${#MODELS_JSON_ITEMS[@]}-1]'
-    unset 'MODELS_SUMMARY[${#MODELS_SUMMARY[@]}-1]'
-  fi
-
-  echo ""
-  echo "Current model list:"
-  printf '%s\n' "${MODELS_SUMMARY[@]}"
-  echo ""
-done
-
-MODELS_JSON="[$(IFS=,; echo "${MODELS_JSON_ITEMS[*]}")]"
-echo "Final inferenceModels: ${MODELS_JSON}"
-echo ""
-
-# -----------------------------------------------------------------------------
-# 9. Ask which platform config(s) to generate
+# 7. Ask which platform config(s) to generate
 # -----------------------------------------------------------------------------
 echo "Which config file should be generated?"
 echo "  1) Windows (.reg)"
@@ -613,7 +474,7 @@ read -rp "Choose [1/2/3]: " PLATFORM_CHOICE
 mkdir -p "${OUT_DIR}"
 
 # -----------------------------------------------------------------------------
-# 10. Fill templates
+# 8. Fill templates
 # -----------------------------------------------------------------------------
 
 # Safely replace a literal (non-regex) token in a file, using perl so that
@@ -641,7 +502,7 @@ else
 fi
 
 generate_mobileconfig() {
-  local out_file="${OUT_DIR}/${INITIALS}_claude_impersonation.mobileconfig"
+  local out_file="${OUT_DIR}/${INITIALS}_claude.mobileconfig"
 
   if [[ ! -f "${MOBILECONFIG_TEMPLATE}" ]]; then
     echo "Error: template not found at ${MOBILECONFIG_TEMPLATE}" >&2
@@ -651,19 +512,17 @@ generate_mobileconfig() {
   cp "${MOBILECONFIG_TEMPLATE}" "${out_file}"
 
   replace_token "${out_file}" '<AIRIA-AI-GATEWAY>' "${AIRIA_AI_GATEWAY}"
-  replace_token "${out_file}" '<AIRIA-GATEWAY-KEY>' "${AIRIA_GATEWAY_KEY}"
-  replace_token "${out_file}" '<CLAUDE-LONGLIVED-TOKEN>' "${CLAUDE_LONGLIVED_TOKEN}"
+  replace_token "${out_file}" '<USER-API-KEY>' "${USER_API_KEY}"
   replace_token "${out_file}" '<OTLP-ENDPOINT>' "${OTLP_ENDPOINT_BASE}"
   replace_token "${out_file}" '<OTLP-API-KEY>' "${OTLP_API_KEY}"
   replace_token "${out_file}" '<USER-EMAIL>' "${USER_EMAIL}"
-  replace_token "${out_file}" '<MODELS-JSON>' "${MODELS_JSON}"
   replace_token "${out_file}" '[{"name":"<MCP-SERVER-NAME>","transport":"http","url":"<MCP-URL>","oauth":{"mode":"dcr"}}]' "${MCP_ARRAY_PLAIN}"
 
   echo "Created: ${out_file}"
 }
 
 generate_reg() {
-  local out_file="${OUT_DIR}/${INITIALS}_claude_impersonation.reg"
+  local out_file="${OUT_DIR}/${INITIALS}_claude.reg"
 
   if [[ ! -f "${REG_TEMPLATE}" ]]; then
     echo "Error: template not found at ${REG_TEMPLATE}" >&2
@@ -690,16 +549,11 @@ generate_reg() {
     mcp_array_escaped="[]"
   fi
 
-  local models_json_escaped
-  models_json_escaped="${MODELS_JSON//\"/\\\"}"
-
   replace_token "${tmp_utf8}" '<AIRIA-AI-GATEWAY>' "${AIRIA_AI_GATEWAY}"
-  replace_token "${tmp_utf8}" '<AIRIA-GATEWAY-KEY>' "${AIRIA_GATEWAY_KEY}"
-  replace_token "${tmp_utf8}" '<CLAUDE-LONGLIVED-TOKEN>' "${CLAUDE_LONGLIVED_TOKEN}"
+  replace_token "${tmp_utf8}" '<USER-API-KEY>' "${USER_API_KEY}"
   replace_token "${tmp_utf8}" '<OTLP-ENDPOINT>' "${OTLP_ENDPOINT_BASE}"
   replace_token "${tmp_utf8}" '<OTLP-API-KEY>' "${OTLP_API_KEY}"
   replace_token "${tmp_utf8}" '<USER-EMAIL>' "${USER_EMAIL}"
-  replace_token "${tmp_utf8}" '<MODELS-JSON>' "${models_json_escaped}"
   replace_token "${tmp_utf8}" '[{\"name\":\"<MCP-SERVER-NAME>\",\"transport\":\"http\",\"url\":\"<MCP-URL>\",\"oauth\":{\"mode\":\"dcr\"}}]' "${mcp_array_escaped}"
 
   iconv -f UTF-8 -t UTF-16LE "${tmp_utf8}" > "${out_file}"
@@ -729,8 +583,7 @@ esac
 echo ""
 echo "============================================================"
 echo " Done."
-echo " These file(s) contain live credentials (Airia gateway key and"
-echo " the user's Anthropic long-lived token) — treat them like"
+echo " These file(s) contain live API keys — treat them like"
 echo " passwords. Do not commit them to source control or share"
 echo " them outside of delivering them to the intended user."
 echo "============================================================"

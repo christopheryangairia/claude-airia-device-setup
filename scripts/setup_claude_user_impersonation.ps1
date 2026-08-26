@@ -1,32 +1,53 @@
 # =============================================================================
-# Airia - Claude Desktop Gateway Setup (Windows PowerShell Version)
+# Airia - Claude Desktop Gateway Setup (User Impersonation, Windows PowerShell)
 #
 # Purpose:
-#   This script sets up Claude Desktop to run through the Airia inference
-#   gateway for a specific user. It will:
+#   Sets up Claude Desktop to run through the Airia inference gateway in
+#   "User Impersonation" mode for a specific user - the user's own Anthropic
+#   plan subscription (Pro/Max/Team/Enterprise) is billed, and Airia stays in
+#   the request path only for routing, logging, and model allow-listing. See
+#   "Claude Desktop via Airia Gateway - Formatted PDF.pdf" for background.
+#
+#   DIFFERENT from setup_claude.ps1 (the default gateway-key flow):
+#     - The Airia-issued gateway key (minted the same way as the default
+#       flow, via /v1/GatewayApiKey) goes into the x-airia-key CUSTOM HEADER,
+#       not into inferenceGatewayApiKey.
+#     - inferenceGatewayApiKey instead holds the USER'S OWN long-lived
+#       Anthropic OAuth token (sk-ant-oat01-...), which the user must mint
+#       themselves by running `claude setup-token` locally (an interactive
+#       browser OAuth flow this script cannot automate) and paste in here.
+#     - Models are NOT auto-discovered - the user must manually enter the
+#       model names to allow (matching the Allowed Models list configured
+#       on the Airia gateway side), plus whether each supports 1M context.
+#
+#   Steps:
 #     1. Ask for / infer the Airia region (from a BASE_URL like the one in
 #        run.sh, e.g. https://sg01.api.airia.ai -> region "sg01")
-#     2. Ask for the AI Gateway URL (suggesting the standard pattern for the
-#        detected region: https://<region>.gateway.airia.ai/)
+#     2. Ask for the AI Gateway URL
 #     3. Ask for the user's email address
 #     4. Request a personal Gateway API key from Airia (User key type) using
-#        that email
-#     5. Derive the OTLP endpoint from the same BASE_URL, and ask for the
+#        that email - becomes the x-airia-key custom header value
+#     5. Ask for the user's Claude long-lived token (sk-ant-oat01-...) -
+#        becomes inferenceGatewayApiKey
+#     6. Derive the OTLP endpoint from the same BASE_URL, and ask for the
 #        OTLP API key (X-API-Key header used for telemetry ingestion)
-#     6. Optionally ask for an MCP server name + URL to manage
-#     7. Fill in the Windows (.reg) and/or macOS (.mobileconfig) config
+#     7. Optionally ask for an MCP server name + URL to manage
+#     8. Ask the user to manually enter the list of allowed models (name +
+#        whether it supports 1M context), one at a time, then confirm
+#     9. Fill in the Windows (.reg) and/or macOS (.mobileconfig) config
 #        template with all of the above
-#     8. Save the finished, ready-to-install file(s) to ./generated/
+#     10. Save the finished, ready-to-install file(s) to ./generated/
 # =============================================================================
 
 $ErrorActionPreference = "Stop"
 
 $SCRIPT_DIR = $PSScriptRoot
-$OUT_DIR = Join-Path $SCRIPT_DIR "generated"
+$ROOT_DIR = Split-Path $SCRIPT_DIR -Parent
+$OUT_DIR = Join-Path $ROOT_DIR "generated"
 
 # Load environment variables from .env (if present). Keys should be named
 # `MINT_API_KEY` and `GATEWAY_CONFIGURATION_ID`. Values are set in-process.
-$ENV_FILE = Join-Path $SCRIPT_DIR ".env"
+$ENV_FILE = Join-Path $ROOT_DIR ".env"
 function Load-EnvFile {
     param($path)
     if (-not (Test-Path $path)) { return }
@@ -47,15 +68,15 @@ function Load-EnvFile {
 
 Load-EnvFile $ENV_FILE
 
-$REG_TEMPLATE = Join-Path $SCRIPT_DIR "Claude.reg"
-$MOBILECONFIG_TEMPLATE = Join-Path $SCRIPT_DIR "Claude.mobileconfig"
+$REG_TEMPLATE = Join-Path $ROOT_DIR "templates/Claude_user_impersonation.reg"
+$MOBILECONFIG_TEMPLATE = Join-Path $ROOT_DIR "templates/Claude_user_impersonation.mobileconfig"
 
 # -----------------------------------------------------------------------------
-# Fixed admin credentials used only to mint a personal user API key.
-# These are tied to a specific Airia gateway configuration - update them if
-# your organization uses a different admin key / configuration id.
-# The script will read `MINT_API_KEY` and `GATEWAY_CONFIGURATION_ID` from a
-# local `.env` file (or the process environment) if set.
+# Fixed admin credentials used only to mint the Airia gateway key that goes
+# into the x-airia-key custom header. Same mechanism as setup_claude.ps1 - the
+# gateway configuration behind BASE_URL/GATEWAY_CONFIGURATION_ID must have AI
+# Service Authentication set to "User Impersonation" on the Airia side (that
+# is configured in Airia, not here).
 # -----------------------------------------------------------------------------
 $MINT_API_KEY = if ($env:MINT_API_KEY) { $env:MINT_API_KEY } else { "" }
 $GATEWAY_CONFIGURATION_ID = if ($env:GATEWAY_CONFIGURATION_ID) { $env:GATEWAY_CONFIGURATION_ID } else { "" }
@@ -63,11 +84,12 @@ $KEY_TYPE = "User"
 $ENABLED = $true
 
 Write-Host "============================================================"
-Write-Host " Claude Desktop - Airia Gateway Setup"
+Write-Host " Claude Desktop - Airia Gateway Setup (User Impersonation)"
 Write-Host "============================================================"
-Write-Host "This will request a personal Airia gateway API key for a user"
-Write-Host "and generate a ready-to-install Claude Desktop config file"
-Write-Host "(Windows .reg and/or macOS .mobileconfig) with that key baked in."
+Write-Host "This will request a personal Airia gateway key (for the x-airia-key"
+Write-Host "header) and generate a ready-to-install Claude Desktop config file"
+Write-Host "(Windows .reg and/or macOS .mobileconfig) wired for User Impersonation"
+Write-Host "mode - the user's own Anthropic plan subscription is billed."
 Write-Host ""
 
 # -----------------------------------------------------------------------------
@@ -112,7 +134,8 @@ if ($REGION) {
 # 2. Ask for the AI Gateway URL
 # -----------------------------------------------------------------------------
 Write-Host "Go to the Airia Platform > Gateway settings to retrieve your AI Gateway"
-Write-Host "URL. If you don't have access, ask your Admin."
+Write-Host "URL. If you don't have access, ask your Admin. This gateway config must"
+Write-Host "have AI Service Authentication set to 'User Impersonation'."
 if ($REGION) {
     $SUGGESTED_GATEWAY = "https://$REGION.gateway.airia.ai"
     Write-Host "Based on region '$REGION', it is likely: $SUGGESTED_GATEWAY/"
@@ -213,7 +236,7 @@ Write-Host ""
 #     unreliable (404s on some otherwise-valid, enabled keys) - if it fails we
 #     fall back to minting a new key rather than blocking.
 # -----------------------------------------------------------------------------
-$USER_API_KEY = $null
+$AIRIA_GATEWAY_KEY = $null
 if ($GATEWAY_USER_ID) {
     Write-Host "Checking for existing gateway API keys for $USER_EMAIL..."
     $mintHeaders = @{ "X-API-Key" = $MINT_API_KEY }
@@ -245,13 +268,13 @@ if ($GATEWAY_USER_ID) {
                 Write-Host "The retrieved key value is masked/obfuscated: $fetchedKey"
                 $MANUAL_KEY = Read-Host "Paste the real key manually (or leave blank to create a new one instead)"
                 if (-not [string]::IsNullOrWhiteSpace($MANUAL_KEY)) {
-                    $USER_API_KEY = $MANUAL_KEY
+                    $AIRIA_GATEWAY_KEY = $MANUAL_KEY
                     Write-Host "Using manually entered key."
                 } else {
                     Write-Host "No key entered - a new key will be created instead."
                 }
             } elseif ($fetchedKey) {
-                $USER_API_KEY = $fetchedKey
+                $AIRIA_GATEWAY_KEY = $fetchedKey
                 Write-Host "Reusing existing gateway API key."
             } else {
                 Write-Host "Warning: could not retrieve the existing key's value via the API - a new key will be created instead." -ForegroundColor Yellow
@@ -262,10 +285,11 @@ if ($GATEWAY_USER_ID) {
 Write-Host ""
 
 # -----------------------------------------------------------------------------
-# 4. Create the gateway API key (skipped if an existing key was reused above)
+# 4. Create the Airia gateway key (goes into the x-airia-key custom header),
+#    skipped if an existing key was reused above.
 # -----------------------------------------------------------------------------
-if (-not $USER_API_KEY) {
-    Write-Host "Requesting gateway API key from Airia..."
+if (-not $AIRIA_GATEWAY_KEY) {
+    Write-Host "Requesting Airia gateway key (for x-airia-key header) from Airia..."
 
     $ENDPOINT = "$BASE_URL/v1/GatewayApiKey"
     $BODY = @{
@@ -282,7 +306,7 @@ if (-not $USER_API_KEY) {
 
     try {
         $response = Invoke-RestMethod -Uri $ENDPOINT -Method Post -Headers $headers -Body $BODY
-        $USER_API_KEY = $response.apiKey
+        $AIRIA_GATEWAY_KEY = $response.apiKey
     } catch {
         Write-Host "Error: gateway API key request failed." -ForegroundColor Red
         if ($_.Exception.Response) {
@@ -295,13 +319,13 @@ if (-not $USER_API_KEY) {
         Exit
     }
 
-    if ([string]::IsNullOrWhiteSpace($USER_API_KEY)) {
+    if ([string]::IsNullOrWhiteSpace($AIRIA_GATEWAY_KEY)) {
         Write-Host "Error: could not extract apiKey from response." -ForegroundColor Red
         Read-Host "Press Enter to exit"
         Exit
     }
 
-    Write-Host "API key created successfully."
+    Write-Host "Airia gateway key created successfully (will be placed in x-airia-key)."
 }
 Write-Host ""
 
@@ -357,7 +381,40 @@ if (-not $GATEWAY_USER_ID) {
 Write-Host ""
 
 # -----------------------------------------------------------------------------
-# 5. OTLP endpoint (derived from BASE_URL) + OTLP API key
+# 5. Ask for the user's Claude long-lived token (goes into
+#    inferenceGatewayApiKey, sent as Authorization: Bearer)
+# -----------------------------------------------------------------------------
+Write-Host "------------------------------------------------------------"
+Write-Host " Claude long-lived token (Anthropic OAuth token)"
+Write-Host "------------------------------------------------------------"
+Write-Host "This script cannot mint this token for you - it requires an interactive"
+Write-Host "local browser OAuth flow. On the END USER's own machine, have them run:"
+Write-Host ""
+Write-Host "    claude setup-token"
+Write-Host ""
+Write-Host "This opens claude.ai/oauth/authorize (scope: user:inference, PKCE flow)."
+Write-Host "They must approve while signed in to the correct plan account"
+Write-Host "(Pro/Max/Team/Enterprise). The CLI then prints a long-lived (~1 year)"
+Write-Host "token that looks like: sk-ant-oat01-..."
+Write-Host ""
+Write-Host "Security note: treat this token like a password. Anyone holding it can"
+Write-Host "consume the user's plan quota. Do not commit it to source control."
+Write-Host ""
+$CLAUDE_LONGLIVED_TOKEN = Read-Host "Paste the user's sk-ant-oat01-... token"
+if ([string]::IsNullOrWhiteSpace($CLAUDE_LONGLIVED_TOKEN)) {
+    Write-Host "Error: the Claude long-lived token is required." -ForegroundColor Red
+    Read-Host "Press Enter to exit"
+    Exit
+}
+if (-not $CLAUDE_LONGLIVED_TOKEN.StartsWith("sk-ant-oat01-")) {
+    Write-Host "Warning: this doesn't look like a sk-ant-oat01-... token. Continuing" -ForegroundColor Yellow
+    Write-Host "anyway, but double check you didn't paste the ?code=... value or the" -ForegroundColor Yellow
+    Write-Host "Airia gateway key by mistake." -ForegroundColor Yellow
+}
+Write-Host ""
+
+# -----------------------------------------------------------------------------
+# 6. OTLP endpoint (derived from BASE_URL) + OTLP API key
 #    Defaults to the same admin key used to mint the gateway key (MINT_API_KEY)
 #    unless the user wants to provide a separate one for telemetry ingestion.
 # -----------------------------------------------------------------------------
@@ -379,7 +436,7 @@ if ($OTLP_KEY_CHOICE -match '^[Yy]') {
 Write-Host ""
 
 # -----------------------------------------------------------------------------
-# 6. Optional MCP server
+# 7. Optional MCP server
 # -----------------------------------------------------------------------------
 $MCP_ENABLED = $false
 $MCP_NAME = ""
@@ -398,7 +455,84 @@ if ($MCP_CHOICE -match '^[Yy]') {
 Write-Host ""
 
 # -----------------------------------------------------------------------------
-# 7. Ask which platform config(s) to generate
+# 8. Manually entered model list (inferenceModels)
+#    User Impersonation does not auto-discover models - the models entered
+#    here must match the Allowed Models list configured on the Airia gateway
+#    side (an empty allow-list there means "allow all").
+# -----------------------------------------------------------------------------
+Write-Host "------------------------------------------------------------"
+Write-Host " Model list (inferenceModels)"
+Write-Host "------------------------------------------------------------"
+Write-Host "Enter the models Claude Desktop should offer. These must match the"
+Write-Host "Allowed Models list configured on the Airia gateway side. Remember to"
+Write-Host "include claude-haiku-4-5 (used for background tasks)."
+Write-Host ""
+
+$Models = @()
+
+function Show-Models {
+    Write-Host "Current model list:"
+    if ($Models.Count -eq 0) {
+        Write-Host "  (none yet)"
+    } else {
+        foreach ($m in $Models) {
+            Write-Host "  - $($m.name) (supports1m: $($m.supports1m.ToString().ToLower()))"
+        }
+    }
+    Write-Host ""
+}
+
+while ($true) {
+    $ModelName = Read-Host "Model name (e.g. claude-sonnet-4-6), or press Enter to stop adding models"
+    if ([string]::IsNullOrWhiteSpace($ModelName)) {
+        if ($Models.Count -eq 0) {
+            Write-Host "You must enter at least one model." -ForegroundColor Red
+            continue
+        }
+        break
+    }
+
+    $Supports1mChoice = Read-Host "  Does '$ModelName' support 1M context (supports1m)? [y/N]"
+    $Supports1m = $Supports1mChoice -match '^[Yy]'
+
+    $Models += [PSCustomObject]@{ name = $ModelName; supports1m = $Supports1m }
+    Write-Host ""
+}
+
+Show-Models
+
+while ($true) {
+    $ConfirmModels = Read-Host "Confirm this is the final model list? [Y/n]"
+    if ([string]::IsNullOrWhiteSpace($ConfirmModels) -or $ConfirmModels -match '^[Yy]') {
+        if ($Models.Count -eq 0) {
+            Write-Host "You must have at least one model before confirming." -ForegroundColor Red
+            Write-Host ""
+        } else {
+            break
+        }
+    }
+
+    $ExtraModel = Read-Host "Add another model? (leave blank to just remove the last one and re-confirm) Model name"
+    if (-not [string]::IsNullOrWhiteSpace($ExtraModel)) {
+        $ExtraSupports1mChoice = Read-Host "  Does '$ExtraModel' support 1M context (supports1m)? [y/N]"
+        $ExtraSupports1m = $ExtraSupports1mChoice -match '^[Yy]'
+        $Models += [PSCustomObject]@{ name = $ExtraModel; supports1m = $ExtraSupports1m }
+    } elseif ($Models.Count -gt 1) {
+        $Models = $Models[0..($Models.Count - 2)]
+    } elseif ($Models.Count -eq 1) {
+        $Models = @()
+    }
+
+    Show-Models
+}
+
+$ModelsJsonItems = $Models | ForEach-Object { '{"name":"' + $_.name + '","supports1m":' + $_.supports1m.ToString().ToLower() + '}' }
+$MODELS_JSON = '[' + ($ModelsJsonItems -join ',') + ']'
+Write-Host "Final inferenceModels: $MODELS_JSON"
+Write-Host ""
+
+# -----------------------------------------------------------------------------
+# 9. Ask which platform config(s) to generate
 # -----------------------------------------------------------------------------
 Write-Host "Which config file should be generated?"
 Write-Host "  1) Windows (.reg)"
@@ -411,7 +545,7 @@ if (-not (Test-Path $OUT_DIR)) {
 }
 
 # -----------------------------------------------------------------------------
-# 8. Fill templates
+# 10. Fill templates
 # -----------------------------------------------------------------------------
 if ($MCP_ENABLED) {
     $MCP_ARRAY_PLAIN = '[{"name":"' + $MCP_NAME + '","transport":"http","url":"' + $MCP_URL + '","oauth":{"mode":"dcr"}}]'
@@ -420,7 +554,7 @@ if ($MCP_ENABLED) {
 }
 
 function Generate-MobileConfig {
-    $out_file = Join-Path $OUT_DIR "${INITIALS}_claude.mobileconfig"
+    $out_file = Join-Path $OUT_DIR "${INITIALS}_claude_impersonation.mobileconfig"
     if (-not (Test-Path $MOBILECONFIG_TEMPLATE)) {
         Write-Warning "Error: template not found at $MOBILECONFIG_TEMPLATE"
         return
@@ -428,10 +562,12 @@ function Generate-MobileConfig {
 
     $content = Get-Content $MOBILECONFIG_TEMPLATE -Raw
     $content = $content.Replace('<AIRIA-AI-GATEWAY>', $AIRIA_AI_GATEWAY)
-    $content = $content.Replace('<USER-API-KEY>', $USER_API_KEY)
+    $content = $content.Replace('<AIRIA-GATEWAY-KEY>', $AIRIA_GATEWAY_KEY)
+    $content = $content.Replace('<CLAUDE-LONGLIVED-TOKEN>', $CLAUDE_LONGLIVED_TOKEN)
     $content = $content.Replace('<OTLP-ENDPOINT>', $OTLP_ENDPOINT_BASE)
     $content = $content.Replace('<OTLP-API-KEY>', $OTLP_API_KEY)
     $content = $content.Replace('<USER-EMAIL>', $USER_EMAIL)
+    $content = $content.Replace('<MODELS-JSON>', $MODELS_JSON)
     $content = $content.Replace('[{"name":"<MCP-SERVER-NAME>","transport":"http","url":"<MCP-URL>","oauth":{"mode":"dcr"}}]', $MCP_ARRAY_PLAIN)
 
     Set-Content $out_file $content
@@ -439,7 +575,7 @@ function Generate-MobileConfig {
 }
 
 function Generate-Reg {
-    $out_file = Join-Path $OUT_DIR "${INITIALS}_claude.reg"
+    $out_file = Join-Path $OUT_DIR "${INITIALS}_claude_impersonation.reg"
     if (-not (Test-Path $REG_TEMPLATE)) {
         Write-Warning "Error: template not found at $REG_TEMPLATE"
         return
@@ -451,12 +587,16 @@ function Generate-Reg {
         $mcpArrayEscaped = '[]'
     }
 
+    $modelsJsonEscaped = $MODELS_JSON.Replace('"', '\"')
+
     $content = Get-Content $REG_TEMPLATE -Raw
     $content = $content.Replace('<AIRIA-AI-GATEWAY>', $AIRIA_AI_GATEWAY)
-    $content = $content.Replace('<USER-API-KEY>', $USER_API_KEY)
+    $content = $content.Replace('<AIRIA-GATEWAY-KEY>', $AIRIA_GATEWAY_KEY)
+    $content = $content.Replace('<CLAUDE-LONGLIVED-TOKEN>', $CLAUDE_LONGLIVED_TOKEN)
     $content = $content.Replace('<OTLP-ENDPOINT>', $OTLP_ENDPOINT_BASE)
     $content = $content.Replace('<OTLP-API-KEY>', $OTLP_API_KEY)
     $content = $content.Replace('<USER-EMAIL>', $USER_EMAIL)
+    $content = $content.Replace('<MODELS-JSON>', $modelsJsonEscaped)
     $content = $content.Replace('[{\"name\":\"<MCP-SERVER-NAME>\",\"transport\":\"http\",\"url\":\"<MCP-URL>\",\"oauth\":{\"mode\":\"dcr\"}}]', $mcpArrayEscaped)
 
     # Ensure standard Windows Registry UTF-16LE (with BOM) formatting
@@ -478,7 +618,8 @@ switch ($PLATFORM_CHOICE) {
 Write-Host ""
 Write-Host "============================================================"
 Write-Host " Done."
-Write-Host " These file(s) contain live API keys - treat them like"
+Write-Host " These file(s) contain live credentials (Airia gateway key and"
+Write-Host " the user's Anthropic long-lived token) - treat them like"
 Write-Host " passwords. Do not commit them to source control or share"
 Write-Host " them outside of delivering them to the intended user."
 Write-Host "============================================================"

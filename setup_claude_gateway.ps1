@@ -101,6 +101,13 @@ $BASE_URL = $BASE_URL_INPUT
 Write-Host "Using BASE_URL: $BASE_URL"
 Write-Host ""
 
+# App/UI host (used later to build a deep link into Secure > Gateway).
+if ($REGION) {
+    $APP_BASE_URL = "https://$REGION.airia.ai"
+} else {
+    $APP_BASE_URL = $BASE_URL -replace '\.api\.', '.'
+}
+
 # -----------------------------------------------------------------------------
 # 2. Ask for the AI Gateway URL
 # -----------------------------------------------------------------------------
@@ -167,45 +174,186 @@ Write-Host "Using initials: $INITIALS"
 Write-Host ""
 
 # -----------------------------------------------------------------------------
-# 4. Create the gateway API key
+# 3b. Resolve the user's platform id (used for duplicate-key + access checks)
 # -----------------------------------------------------------------------------
-Write-Host "Requesting gateway API key from Airia..."
+$USERS_ENDPOINT = "$BASE_URL/v1/Users"
 
-$ENDPOINT = "$BASE_URL/v1/GatewayApiKey"
-$BODY = @{
-    gatewayConfigurationId = $GATEWAY_CONFIGURATION_ID
-    type                   = $KEY_TYPE
-    enabled                = $ENABLED
-    email                  = $USER_EMAIL
-} | ConvertTo-Json
-
-$headers = @{
-    "Content-Type" = "application/json"
-    "X-API-Key"    = $MINT_API_KEY
-}
-
-try {
-    $response = Invoke-RestMethod -Uri $ENDPOINT -Method Post -Headers $headers -Body $BODY
-    $USER_API_KEY = $response.apiKey
-} catch {
-    Write-Host "Error: gateway API key request failed." -ForegroundColor Red
-    if ($_.Exception.Response) {
-        $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
-        Write-Host "Response: $($reader.ReadToEnd())" -ForegroundColor Red
-    } else {
-        Write-Host "Exception: $($_.Exception.Message)" -ForegroundColor Red
+function Resolve-GatewayUserId {
+    $headers = @{ "X-API-Key" = $MINT_API_KEY }
+    $page = 1
+    $pageSize = 100
+    $maxPages = 20
+    while ($page -le $maxPages) {
+        try {
+            $resp = Invoke-RestMethod -Uri "$USERS_ENDPOINT`?pageSize=$pageSize&pageNumber=$page" -Method Get -Headers $headers
+        } catch {
+            return $null
+        }
+        $match = $resp.items | Where-Object { $_.email -and ($_.email.ToLower() -eq $USER_EMAIL.ToLower()) } | Select-Object -First 1
+        if ($match) {
+            return $match.id
+        }
+        if (-not $resp.items -or $resp.items.Count -lt $pageSize) {
+            break
+        }
+        $page++
     }
-    Read-Host "Press Enter to exit"
-    Exit
+    return $null
 }
 
-if ([string]::IsNullOrWhiteSpace($USER_API_KEY)) {
-    Write-Host "Error: could not extract apiKey from response." -ForegroundColor Red
-    Read-Host "Press Enter to exit"
-    Exit
+Write-Host "Looking up $USER_EMAIL in the tenant user directory..."
+$GATEWAY_USER_ID = Resolve-GatewayUserId
+Write-Host ""
+
+# -----------------------------------------------------------------------------
+# 3c. Check for an existing gateway API key for this user before minting a
+#     new one. GET /v1/GatewayConfiguration/{id} lists apiKeys[] (masked
+#     values only) with a resourceId matching the platform user id above.
+#     GET /v1/GatewayApiKey/{keyId} can return the full value, but has proven
+#     unreliable (404s on some otherwise-valid, enabled keys) - if it fails we
+#     fall back to minting a new key rather than blocking.
+# -----------------------------------------------------------------------------
+$USER_API_KEY = $null
+if ($GATEWAY_USER_ID) {
+    Write-Host "Checking for existing gateway API keys for $USER_EMAIL..."
+    $mintHeaders = @{ "X-API-Key" = $MINT_API_KEY }
+    try {
+        $configResponse = Invoke-RestMethod -Uri "$BASE_URL/v1/GatewayConfiguration/$GATEWAY_CONFIGURATION_ID" -Method Get -Headers $mintHeaders
+    } catch {
+        $configResponse = $null
+    }
+
+    $existingKeys = @()
+    if ($configResponse -and $configResponse.apiKeys) {
+        $existingKeys = @($configResponse.apiKeys | Where-Object { $_.resourceId -eq $GATEWAY_USER_ID -and $_.enabled })
+    }
+
+    if ($existingKeys.Count -gt 0) {
+        Write-Host "User API key detected: found $($existingKeys.Count) existing enabled gateway API key(s) for '$USER_EMAIL'."
+        $REUSE_CHOICE = Read-Host "Use an existing key instead of creating another? [y/N]"
+        if ($REUSE_CHOICE -match '^[Yy]') {
+            $reuseKeyId = $existingKeys[0].id
+            $fetchedKey = $null
+            try {
+                $fetched = Invoke-RestMethod -Uri "$BASE_URL/v1/GatewayApiKey/$reuseKeyId" -Method Get -Headers $mintHeaders
+                $fetchedKey = $fetched.apiKey
+            } catch {
+                $fetchedKey = $null
+            }
+
+            if ($fetchedKey -and $fetchedKey.Contains([char]0x2022)) {
+                Write-Host "The retrieved key value is masked/obfuscated: $fetchedKey"
+                $MANUAL_KEY = Read-Host "Paste the real key manually (or leave blank to create a new one instead)"
+                if (-not [string]::IsNullOrWhiteSpace($MANUAL_KEY)) {
+                    $USER_API_KEY = $MANUAL_KEY
+                    Write-Host "Using manually entered key."
+                } else {
+                    Write-Host "No key entered - a new key will be created instead."
+                }
+            } elseif ($fetchedKey) {
+                $USER_API_KEY = $fetchedKey
+                Write-Host "Reusing existing gateway API key."
+            } else {
+                Write-Host "Warning: could not retrieve the existing key's value via the API - a new key will be created instead." -ForegroundColor Yellow
+            }
+        }
+    }
+}
+Write-Host ""
+
+# -----------------------------------------------------------------------------
+# 4. Create the gateway API key (skipped if an existing key was reused above)
+# -----------------------------------------------------------------------------
+if (-not $USER_API_KEY) {
+    Write-Host "Requesting gateway API key from Airia..."
+
+    $ENDPOINT = "$BASE_URL/v1/GatewayApiKey"
+    $BODY = @{
+        gatewayConfigurationId = $GATEWAY_CONFIGURATION_ID
+        type                   = $KEY_TYPE
+        enabled                = $ENABLED
+        email                  = $USER_EMAIL
+    } | ConvertTo-Json
+
+    $headers = @{
+        "Content-Type" = "application/json"
+        "X-API-Key"    = $MINT_API_KEY
+    }
+
+    try {
+        $response = Invoke-RestMethod -Uri $ENDPOINT -Method Post -Headers $headers -Body $BODY
+        $USER_API_KEY = $response.apiKey
+    } catch {
+        Write-Host "Error: gateway API key request failed." -ForegroundColor Red
+        if ($_.Exception.Response) {
+            $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
+            Write-Host "Response: $($reader.ReadToEnd())" -ForegroundColor Red
+        } else {
+            Write-Host "Exception: $($_.Exception.Message)" -ForegroundColor Red
+        }
+        Read-Host "Press Enter to exit"
+        Exit
+    }
+
+    if ([string]::IsNullOrWhiteSpace($USER_API_KEY)) {
+        Write-Host "Error: could not extract apiKey from response." -ForegroundColor Red
+        Read-Host "Press Enter to exit"
+        Exit
+    }
+
+    Write-Host "API key created successfully."
+}
+Write-Host ""
+
+# -----------------------------------------------------------------------------
+# 4b. Verify the user has gateway access (checks users-access list)
+#     users-access only returns gatewayUserId (no email); GATEWAY_USER_ID was
+#     already resolved above, so we just check whether that id appears as a
+#     gatewayUserId in the gateway's users-access list.
+# -----------------------------------------------------------------------------
+$ACCESS_ENDPOINT = "$BASE_URL/v1/GatewayConfiguration/$GATEWAY_CONFIGURATION_ID/users-access"
+$GATEWAY_EDIT_URL = "$APP_BASE_URL/gateway/ai/$GATEWAY_CONFIGURATION_ID/edit?pageNumber=1&pageSize=50"
+
+function Test-GatewayAccessForId($userId) {
+    if (-not $userId) { return $false }
+    $headers = @{ "X-API-Key" = $MINT_API_KEY }
+    try {
+        $resp = Invoke-RestMethod -Uri "$ACCESS_ENDPOINT`?pageNumber=1&pageSize=1000" -Method Get -Headers $headers
+        return [bool]($resp.items | Where-Object { $_.gatewayUserId -eq $userId })
+    } catch {
+        return $false
+    }
 }
 
-Write-Host "API key created successfully."
+if (-not $GATEWAY_USER_ID) {
+    Write-Host "Could not find '$USER_EMAIL' in the tenant user directory (Users list) - cannot verify gateway access automatically."
+    Write-Host "Please go to: Secure > Gateway > set the user access to this email."
+    Write-Host "  $GATEWAY_EDIT_URL"
+    $ACCESS_CONFIRM = Read-Host "Have you done it? [y/N]"
+    if ($ACCESS_CONFIRM -notmatch '^[Yy]') {
+        Write-Host "Warning: continuing without confirmed gateway access." -ForegroundColor Yellow
+    }
+} elseif (Test-GatewayAccessForId $GATEWAY_USER_ID) {
+    Write-Host "User verified to have access. Proceeding..."
+} else {
+    Write-Host "User '$USER_EMAIL' was not found in the gateway access list."
+    Write-Host "Please go to: Secure > Gateway > set the user access to this email."
+    Write-Host "  $GATEWAY_EDIT_URL"
+    while ($true) {
+        $ACCESS_CONFIRM = Read-Host "Have you done it? [y/N]"
+        if ($ACCESS_CONFIRM -match '^[Yy]') {
+            if (Test-GatewayAccessForId $GATEWAY_USER_ID) {
+                Write-Host "User verified to have access. Proceeding..."
+                break
+            } else {
+                Write-Host "Still not finding '$USER_EMAIL' in the access list. Please double-check and try again."
+            }
+        } else {
+            Write-Host "Warning: continuing without confirmed gateway access." -ForegroundColor Yellow
+            break
+        }
+    }
+}
 Write-Host ""
 
 # -----------------------------------------------------------------------------

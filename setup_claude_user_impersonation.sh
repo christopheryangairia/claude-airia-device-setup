@@ -151,6 +151,13 @@ BASE_URL="${BASE_URL_INPUT}"
 echo "Using BASE_URL: ${BASE_URL}"
 echo ""
 
+# App/UI host (used later to build a deep link into Secure > Gateway).
+if [[ -n "${REGION}" ]]; then
+  APP_BASE_URL="https://${REGION}.airia.ai"
+else
+  APP_BASE_URL="${BASE_URL/.api./.}"
+fi
+
 # -----------------------------------------------------------------------------
 # 2. Ask for the AI Gateway URL
 # -----------------------------------------------------------------------------
@@ -219,13 +226,138 @@ echo "Using initials: ${INITIALS}"
 echo ""
 
 # -----------------------------------------------------------------------------
-# 4. Create the Airia gateway key (goes into the x-airia-key custom header)
+# 3b. Resolve the user's platform id (used for duplicate-key + access checks)
 # -----------------------------------------------------------------------------
-echo "Requesting Airia gateway key (for x-airia-key header) from Airia..."
+USERS_ENDPOINT="${BASE_URL}/v1/Users"
 
-ENDPOINT="${BASE_URL}/v1/GatewayApiKey"
+resolve_user_id() {
+  local page=1 page_size=100 max_pages=20
+  while (( page <= max_pages )); do
+    local resp id item_count
+    resp=$(curl --silent --show-error \
+      --request GET \
+      --url "${USERS_ENDPOINT}?pageSize=${page_size}&pageNumber=${page}" \
+      --header "X-API-Key: ${MINT_API_KEY}" 2>/dev/null)
 
-BODY=$(cat <<EOF
+    if command -v jq &>/dev/null; then
+      id=$(echo "${resp}" | jq -r --arg email "${USER_EMAIL}" \
+        '.items[]? | select((.email // "" | ascii_downcase) == ($email | ascii_downcase)) | .id' 2>/dev/null | head -n1) || true
+      item_count=$(echo "${resp}" | jq -r '.items | length' 2>/dev/null) || true
+    elif command -v python3 &>/dev/null; then
+      id=$(python3 -c "
+import json, sys
+try:
+    data = json.loads(sys.argv[1])
+except Exception:
+    sys.exit(0)
+email = sys.argv[2].lower()
+items = data.get('items', [])
+for u in items:
+    if (u.get('email') or '').lower() == email:
+        print(u.get('id', ''))
+        break
+" "${resp}" "${USER_EMAIL}")
+      item_count="${page_size}"
+    else
+      id=""
+      item_count="0"
+    fi
+
+    if [[ -n "${id}" ]]; then
+      echo "${id}"
+      return 0
+    fi
+    [[ -z "${item_count}" || "${item_count}" -lt "${page_size}" ]] && break
+    page=$((page + 1))
+  done
+  echo ""
+}
+
+echo "Looking up '${USER_EMAIL}' in the tenant user directory..."
+GATEWAY_USER_ID="$(resolve_user_id)"
+echo ""
+
+# -----------------------------------------------------------------------------
+# 3c. Check for an existing gateway API key for this user before minting a
+#     new one. GET /v1/GatewayConfiguration/{id} lists apiKeys[] (masked
+#     values only) with a resourceId matching the platform user id above.
+#     GET /v1/GatewayApiKey/{keyId} can return the full value, but has proven
+#     unreliable (404s on some otherwise-valid, enabled keys) — if it fails
+#     we fall back to minting a new key rather than blocking.
+# -----------------------------------------------------------------------------
+AIRIA_GATEWAY_KEY=""
+if [[ -n "${GATEWAY_USER_ID}" ]]; then
+  echo "Checking for existing gateway API keys for ${USER_EMAIL}..."
+  CONFIG_RESPONSE=$(curl --silent --show-error \
+    --request GET \
+    --url "${BASE_URL}/v1/GatewayConfiguration/${GATEWAY_CONFIGURATION_ID}" \
+    --header "X-API-Key: ${MINT_API_KEY}" 2>/dev/null)
+
+  if command -v jq &>/dev/null; then
+    EXISTING_KEY_IDS=$(echo "${CONFIG_RESPONSE}" | jq -r --arg uid "${GATEWAY_USER_ID}" \
+      '.apiKeys[]? | select(.resourceId == $uid and .enabled == true) | .id' 2>/dev/null) || true
+  elif command -v python3 &>/dev/null; then
+    EXISTING_KEY_IDS=$(python3 -c "
+import json, sys
+try:
+    data = json.loads(sys.argv[1])
+except Exception:
+    sys.exit(0)
+uid = sys.argv[2]
+for k in data.get('apiKeys', []):
+    if k.get('resourceId') == uid and k.get('enabled'):
+        print(k.get('id', ''))
+" "${CONFIG_RESPONSE}" "${GATEWAY_USER_ID}")
+  else
+    EXISTING_KEY_IDS=""
+  fi
+
+  if [[ -n "${EXISTING_KEY_IDS}" ]]; then
+    EXISTING_KEY_COUNT=$(echo "${EXISTING_KEY_IDS}" | wc -l | tr -d ' ')
+    echo "User API key detected: found ${EXISTING_KEY_COUNT} existing enabled gateway API key(s) for '${USER_EMAIL}'."
+    read -rp "Use an existing key instead of creating another? [y/N]: " REUSE_CHOICE
+    if [[ "${REUSE_CHOICE}" =~ ^[Yy] ]]; then
+      REUSE_KEY_ID=$(echo "${EXISTING_KEY_IDS}" | head -n1)
+      FETCHED=$(curl --silent --show-error \
+        --request GET \
+        --url "${BASE_URL}/v1/GatewayApiKey/${REUSE_KEY_ID}" \
+        --header "X-API-Key: ${MINT_API_KEY}" 2>/dev/null)
+      if command -v jq &>/dev/null; then
+        FETCHED_KEY=$(echo "${FETCHED}" | jq -r '.apiKey // empty' 2>/dev/null) || true
+      else
+        FETCHED_KEY=$(echo "${FETCHED}" | grep -o '"apiKey":"[^"]*"' | cut -d'"' -f4)
+      fi
+
+      if [[ -n "${FETCHED_KEY}" && "${FETCHED_KEY}" == *"•"* ]]; then
+        echo "The retrieved key value is masked/obfuscated: ${FETCHED_KEY}"
+        read -rp "Paste the real key manually (or leave blank to create a new one instead): " MANUAL_KEY
+        if [[ -n "${MANUAL_KEY}" ]]; then
+          AIRIA_GATEWAY_KEY="${MANUAL_KEY}"
+          echo "Using manually entered key."
+        else
+          echo "No key entered — a new key will be created instead."
+        fi
+      elif [[ -n "${FETCHED_KEY}" ]]; then
+        AIRIA_GATEWAY_KEY="${FETCHED_KEY}"
+        echo "Reusing existing gateway API key."
+      else
+        echo "Warning: could not retrieve the existing key's value via the API — a new key will be created instead." >&2
+      fi
+    fi
+  fi
+fi
+echo ""
+
+# -----------------------------------------------------------------------------
+# 4. Create the Airia gateway key (goes into the x-airia-key custom header),
+#    skipped if an existing key was reused above.
+# -----------------------------------------------------------------------------
+if [[ -z "${AIRIA_GATEWAY_KEY}" ]]; then
+  echo "Requesting Airia gateway key (for x-airia-key header) from Airia..."
+
+  ENDPOINT="${BASE_URL}/v1/GatewayApiKey"
+
+  BODY=$(cat <<EOF
 {
   "gatewayConfigurationId": "${GATEWAY_CONFIGURATION_ID}",
   "type": "${KEY_TYPE}",
@@ -233,38 +365,90 @@ BODY=$(cat <<EOF
   "email": "${USER_EMAIL}"
 }
 EOF
-)
+  )
 
-HTTP_RESPONSE=$(curl --silent --show-error \
-  --request POST \
-  --url "${ENDPOINT}" \
-  --header "Content-Type: application/json" \
-  --header "X-API-Key: ${MINT_API_KEY}" \
-  --data "${BODY}" \
-  --write-out "\n%{http_code}" 2>/dev/null)
+  HTTP_RESPONSE=$(curl --silent --show-error \
+    --request POST \
+    --url "${ENDPOINT}" \
+    --header "Content-Type: application/json" \
+    --header "X-API-Key: ${MINT_API_KEY}" \
+    --data "${BODY}" \
+    --write-out "\n%{http_code}" 2>/dev/null)
 
-HTTP_STATUS=$(echo "${HTTP_RESPONSE}" | tail -n1)
-RESPONSE=$(echo "${HTTP_RESPONSE}" | sed '$d')
+  HTTP_STATUS=$(echo "${HTTP_RESPONSE}" | tail -n1)
+  RESPONSE=$(echo "${HTTP_RESPONSE}" | sed '$d')
 
-if [[ "${HTTP_STATUS}" -lt 200 || "${HTTP_STATUS}" -ge 300 ]]; then
-  echo "Error: gateway API key request failed (HTTP ${HTTP_STATUS})." >&2
-  echo "Response: ${RESPONSE}" >&2
-  exit 1
+  if [[ "${HTTP_STATUS}" -lt 200 || "${HTTP_STATUS}" -ge 300 ]]; then
+    echo "Error: gateway API key request failed (HTTP ${HTTP_STATUS})." >&2
+    echo "Response: ${RESPONSE}" >&2
+    exit 1
+  fi
+
+  if command -v jq &>/dev/null; then
+    AIRIA_GATEWAY_KEY=$(echo "${RESPONSE}" | jq -r '.apiKey // empty')
+  else
+    AIRIA_GATEWAY_KEY=$(echo "${RESPONSE}" | grep -o '"apiKey":"[^"]*"' | cut -d'"' -f4)
+  fi
+
+  if [[ -z "${AIRIA_GATEWAY_KEY}" ]]; then
+    echo "Error: could not extract apiKey from response." >&2
+    echo "Response: ${RESPONSE}" >&2
+    exit 1
+  fi
+
+  echo "Airia gateway key created successfully (will be placed in x-airia-key)."
 fi
+echo ""
 
-if command -v jq &>/dev/null; then
-  AIRIA_GATEWAY_KEY=$(echo "${RESPONSE}" | jq -r '.apiKey // empty')
+# -----------------------------------------------------------------------------
+# 4b. Verify the user has gateway access (checks users-access list)
+#     users-access only returns gatewayUserId (no email); GATEWAY_USER_ID was
+#     already resolved above, so we just check whether that id appears as a
+#     gatewayUserId in the gateway's users-access list.
+# -----------------------------------------------------------------------------
+ACCESS_ENDPOINT="${BASE_URL}/v1/GatewayConfiguration/${GATEWAY_CONFIGURATION_ID}/users-access"
+GATEWAY_EDIT_URL="${APP_BASE_URL}/gateway/ai/${GATEWAY_CONFIGURATION_ID}/edit?pageNumber=1&pageSize=50"
+
+check_gateway_access_for_id() {
+  local user_id="$1"
+  [[ -z "${user_id}" ]] && return 1
+  local resp
+  resp=$(curl --silent --show-error \
+    --request GET \
+    --url "${ACCESS_ENDPOINT}?pageNumber=1&pageSize=1000" \
+    --header "X-API-Key: ${MINT_API_KEY}" 2>/dev/null)
+  [[ "${resp}" == *"\"gatewayUserId\":\"${user_id}\""* ]]
+}
+
+if [[ -z "${GATEWAY_USER_ID}" ]]; then
+  echo "Could not find '${USER_EMAIL}' in the tenant user directory (Users list) — cannot verify gateway access automatically."
+  echo "Please go to: Secure > Gateway > set the user access to this email."
+  echo "  ${GATEWAY_EDIT_URL}"
+  read -rp "Have you done it? [y/N]: " ACCESS_CONFIRM
+  if [[ ! "${ACCESS_CONFIRM}" =~ ^[Yy] ]]; then
+    echo "Warning: continuing without confirmed gateway access." >&2
+  fi
+elif check_gateway_access_for_id "${GATEWAY_USER_ID}"; then
+  echo "User verified to have access. Proceeding..."
 else
-  AIRIA_GATEWAY_KEY=$(echo "${RESPONSE}" | grep -o '"apiKey":"[^"]*"' | cut -d'"' -f4)
+  echo "User '${USER_EMAIL}' was not found in the gateway access list."
+  echo "Please go to: Secure > Gateway > set the user access to this email."
+  echo "  ${GATEWAY_EDIT_URL}"
+  while true; do
+    read -rp "Have you done it? [y/N]: " ACCESS_CONFIRM
+    if [[ "${ACCESS_CONFIRM}" =~ ^[Yy] ]]; then
+      if check_gateway_access_for_id "${GATEWAY_USER_ID}"; then
+        echo "User verified to have access. Proceeding..."
+        break
+      else
+        echo "Still not finding '${USER_EMAIL}' in the access list. Please double-check and try again."
+      fi
+    else
+      echo "Warning: continuing without confirmed gateway access." >&2
+      break
+    fi
+  done
 fi
-
-if [[ -z "${AIRIA_GATEWAY_KEY}" ]]; then
-  echo "Error: could not extract apiKey from response." >&2
-  echo "Response: ${RESPONSE}" >&2
-  exit 1
-fi
-
-echo "Airia gateway key created successfully (will be placed in x-airia-key)."
 echo ""
 
 # -----------------------------------------------------------------------------

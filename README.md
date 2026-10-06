@@ -189,6 +189,11 @@ fully automatic, some only prompt you conditionally:
 9. **Optional MCP server** — If you want Claude Desktop to auto-connect to a
    managed MCP server for this user, say yes and provide a name and URL. If
    you decline, the config is generated with no MCP servers registered.
+10. **Data import / export** — Asks whether users may import their existing
+    Claude.ai history (and third-party history, e.g. ChatGPT) into this
+    managed install, and export their data back out. Defaults to **no**.
+    Either answer writes an explicit policy, so a decline is a deliberate
+    deny rather than falling back to whatever the app defaults to.
 
 At the end, you choose whether to generate the Windows `.reg`, the macOS
 `.mobileconfig`, or both. Output files are written to `./generated/` as
@@ -216,6 +221,7 @@ these before writing the final file to `./generated/`.
 | `<OTLP-API-KEY>` | Either `MINT_API_KEY` (default) or a separate key you provide in step 8 | Value sent as the `X-API-KEY` header (`otlpHeaders`) when Claude Desktop pushes telemetry to the OTLP endpoint above. |
 | `<USER-EMAIL>` | The email entered in step 3 | Used to tag telemetry with the user's identity (`otlpResourceAttributes` → `airia.user-email`), and is the identity the personal API key was minted for. |
 | `<MCP-SERVER-NAME>` / `<MCP-URL>` | The values entered in step 9, if you opted in | Name and URL of a managed MCP server for Claude Desktop to auto-register (`managedMcpServers`). If you decline MCP setup, this whole field is written as an empty array (`[]`) instead of leaving these placeholders unfilled. |
+| `<CLAUDE-AI-IMPORT>` | A JSON policy blob derived from your yes/no answer in step 10 | Controls data import/export (`claudeAiImport`). Four sub-fields: `enabled` (may the user import their Claude.ai history at all), `automatic3pImport` (auto-offer import from third-party AI tools such as ChatGPT), `exportEnabled` (may the user export their data back out), and `bannerBehavior` (`show`/`hide` the in-app import banner). Answering **y** writes all three booleans `true` with `bannerBehavior: show`; answering **N** writes all three `false` with `bannerBehavior: hide`. |
 
 A few settings in the templates are **not** placeholders — they're fixed
 values baked into the templates themselves and aren't touched by the script:
@@ -375,7 +381,7 @@ Troubleshooting table in the PDF.
    add more or remove the last entry) before writing it into
    `inferenceModels`.
 5. Everything else — BASE_URL/region detection, AI Gateway URL, user email,
-   OTLP endpoint/key, optional MCP server, output platform choice — works
+   OTLP endpoint/key, optional MCP server, data import/export, output platform choice — works
    identically to `scripts/setup_claude_gateway.sh`/`.ps1`. That includes the same
    pre-mint checks described in [Section 2](#2-what-the-script-asks-you-step-by-step):
    resolving the email to a platform user id, checking for and optionally
@@ -393,6 +399,7 @@ Troubleshooting table in the PDF.
 | `<OTLP-ENDPOINT>` / `<OTLP-API-KEY>` / `<USER-EMAIL>` | Same as the default flow | Telemetry wiring — unchanged from `scripts/setup_claude_gateway.sh`/`.ps1`. |
 | `<MODELS-JSON>` | The confirmed model list from the manual model list step ("What's different" item 4 above), e.g. `[{"name":"claude-sonnet-4-6","supports1m":false},{"name":"claude-haiku-4-5","supports1m":false}]` | Written into `inferenceModels`. Must match the Allowed Models list on the Airia gateway side. |
 | `<MCP-SERVER-NAME>` / `<MCP-URL>` | Same as the default flow | `managedMcpServers`, or `[]` if declined. |
+| `<CLAUDE-AI-IMPORT>` | Same as the default flow | `claudeAiImport` — the data import/export policy blob. See the [default placeholder reference](#3-placeholder-reference) for the four sub-fields. |
 
 Output files land in `./generated/` as `<INITIALS>_claude_impersonation.reg`
 / `<INITIALS>_claude_impersonation.mobileconfig` — same live-credential

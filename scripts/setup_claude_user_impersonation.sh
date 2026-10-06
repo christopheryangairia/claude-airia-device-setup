@@ -39,9 +39,10 @@
 #     8. Ask the user to manually enter the list of discovered/allowed
 #        models (name + whether it supports 1M context), one at a time,
 #        then confirm the final list
-#     9. Fill in the Windows (.reg) and/or macOS (.mobileconfig) config
+#     9. Ask whether users may import/export their Claude data
+#     10. Fill in the Windows (.reg) and/or macOS (.mobileconfig) config
 #        template with all of the above
-#     10. Save the finished, ready-to-install file(s) to ./generated/
+#     11. Save the finished, ready-to-install file(s) to ./generated/
 #
 # Requires: bash, curl, perl. jq is optional but recommended (falls back to
 #           grep). iconv is required to safely edit the UTF-16 .reg file.
@@ -603,7 +604,26 @@ echo "Final inferenceModels: ${MODELS_JSON}"
 echo ""
 
 # -----------------------------------------------------------------------------
-# 9. Ask which platform config(s) to generate
+# 9. Claude data import / export
+#    Controls whether users may import their existing Claude.ai history (and
+#    third-party history, e.g. ChatGPT) into this managed install, and whether
+#    they may export their data back out. Written as a single JSON policy blob
+#    (claudeAiImport). Declining writes an explicit "everything false" policy
+#    rather than omitting the key, so the deny is deliberate instead of relying
+#    on whatever the app defaults to.
+# -----------------------------------------------------------------------------
+read -rp "Allow users to import their data into Claude (and export it out)? [y/N]: " IMPORT_EXPORT_CHOICE
+if [[ "${IMPORT_EXPORT_CHOICE}" =~ ^[Yy] ]]; then
+  CLAUDE_AI_IMPORT='{"enabled":true,"automatic3pImport":true,"exportEnabled":true,"bannerBehavior":"show"}'
+  echo "Data import/export: enabled."
+else
+  CLAUDE_AI_IMPORT='{"enabled":false,"automatic3pImport":false,"exportEnabled":false,"bannerBehavior":"hide"}'
+  echo "Data import/export: disabled."
+fi
+echo ""
+
+# -----------------------------------------------------------------------------
+# 10. Ask which platform config(s) to generate
 # -----------------------------------------------------------------------------
 echo "Which config file should be generated?"
 echo "  1) Windows (.reg)"
@@ -614,7 +634,7 @@ read -rp "Choose [1/2/3]: " PLATFORM_CHOICE
 mkdir -p "${OUT_DIR}"
 
 # -----------------------------------------------------------------------------
-# 10. Fill templates
+# 11. Fill templates
 # -----------------------------------------------------------------------------
 
 # Safely replace a literal (non-regex) token in a file, using perl so that
@@ -658,6 +678,7 @@ generate_mobileconfig() {
   replace_token "${out_file}" '<OTLP-API-KEY>' "${OTLP_API_KEY}"
   replace_token "${out_file}" '<USER-EMAIL>' "${USER_EMAIL}"
   replace_token "${out_file}" '<MODELS-JSON>' "${MODELS_JSON}"
+  replace_token "${out_file}" '<CLAUDE-AI-IMPORT>' "${CLAUDE_AI_IMPORT}"
   replace_token "${out_file}" '[{"name":"<MCP-SERVER-NAME>","transport":"http","url":"<MCP-URL>","oauth":{"mode":"dcr"}}]' "${MCP_ARRAY_PLAIN}"
 
   echo "Created: ${out_file}"
@@ -694,6 +715,10 @@ generate_reg() {
   local models_json_escaped
   models_json_escaped="${MODELS_JSON//\"/\\\"}"
 
+  # The .reg format wraps values in double quotes, so any quote inside a JSON
+  # blob has to be backslash-escaped.
+  local claude_ai_import_escaped="${CLAUDE_AI_IMPORT//\"/\\\"}"
+
   replace_token "${tmp_utf8}" '<AIRIA-AI-GATEWAY>' "${AIRIA_AI_GATEWAY}"
   replace_token "${tmp_utf8}" '<AIRIA-GATEWAY-KEY>' "${AIRIA_GATEWAY_KEY}"
   replace_token "${tmp_utf8}" '<CLAUDE-LONGLIVED-TOKEN>' "${CLAUDE_LONGLIVED_TOKEN}"
@@ -701,6 +726,7 @@ generate_reg() {
   replace_token "${tmp_utf8}" '<OTLP-API-KEY>' "${OTLP_API_KEY}"
   replace_token "${tmp_utf8}" '<USER-EMAIL>' "${USER_EMAIL}"
   replace_token "${tmp_utf8}" '<MODELS-JSON>' "${models_json_escaped}"
+  replace_token "${tmp_utf8}" '<CLAUDE-AI-IMPORT>' "${claude_ai_import_escaped}"
   replace_token "${tmp_utf8}" '[{\"name\":\"<MCP-SERVER-NAME>\",\"transport\":\"http\",\"url\":\"<MCP-URL>\",\"oauth\":{\"mode\":\"dcr\"}}]' "${mcp_array_escaped}"
 
   iconv -f UTF-8 -t UTF-16LE "${tmp_utf8}" > "${out_file}"

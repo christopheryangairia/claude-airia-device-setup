@@ -34,9 +34,10 @@
 #     7. Optionally ask for an MCP server name + URL to manage
 #     8. Ask the user to manually enter the list of allowed models (name +
 #        whether it supports 1M context), one at a time, then confirm
-#     9. Fill in the Windows (.reg) and/or macOS (.mobileconfig) config
+#     9. Ask whether users may import/export their Claude data
+#     10. Fill in the Windows (.reg) and/or macOS (.mobileconfig) config
 #        template with all of the above
-#     10. Save the finished, ready-to-install file(s) to ./generated/
+#     11. Save the finished, ready-to-install file(s) to ./generated/
 # =============================================================================
 
 $ErrorActionPreference = "Stop"
@@ -532,7 +533,26 @@ Write-Host "Final inferenceModels: $MODELS_JSON"
 Write-Host ""
 
 # -----------------------------------------------------------------------------
-# 9. Ask which platform config(s) to generate
+# 9. Claude data import / export
+#    Controls whether users may import their existing Claude.ai history (and
+#    third-party history, e.g. ChatGPT) into this managed install, and whether
+#    they may export their data back out. Written as a single JSON policy blob
+#    (claudeAiImport). Declining writes an explicit "everything false" policy
+#    rather than omitting the key, so the deny is deliberate instead of relying
+#    on whatever the app defaults to.
+# -----------------------------------------------------------------------------
+$IMPORT_EXPORT_CHOICE = Read-Host "Allow users to import their data into Claude (and export it out)? [y/N]"
+if ($IMPORT_EXPORT_CHOICE -match '^[Yy]') {
+    $CLAUDE_AI_IMPORT = '{"enabled":true,"automatic3pImport":true,"exportEnabled":true,"bannerBehavior":"show"}'
+    Write-Host "Data import/export: enabled."
+} else {
+    $CLAUDE_AI_IMPORT = '{"enabled":false,"automatic3pImport":false,"exportEnabled":false,"bannerBehavior":"hide"}'
+    Write-Host "Data import/export: disabled."
+}
+Write-Host ""
+
+# -----------------------------------------------------------------------------
+# 10. Ask which platform config(s) to generate
 # -----------------------------------------------------------------------------
 Write-Host "Which config file should be generated?"
 Write-Host "  1) Windows (.reg)"
@@ -545,7 +565,7 @@ if (-not (Test-Path $OUT_DIR)) {
 }
 
 # -----------------------------------------------------------------------------
-# 10. Fill templates
+# 11. Fill templates
 # -----------------------------------------------------------------------------
 if ($MCP_ENABLED) {
     $MCP_ARRAY_PLAIN = '[{"name":"' + $MCP_NAME + '","transport":"http","url":"' + $MCP_URL + '","oauth":{"mode":"dcr"}}]'
@@ -568,6 +588,7 @@ function Generate-MobileConfig {
     $content = $content.Replace('<OTLP-API-KEY>', $OTLP_API_KEY)
     $content = $content.Replace('<USER-EMAIL>', $USER_EMAIL)
     $content = $content.Replace('<MODELS-JSON>', $MODELS_JSON)
+    $content = $content.Replace('<CLAUDE-AI-IMPORT>', $CLAUDE_AI_IMPORT)
     $content = $content.Replace('[{"name":"<MCP-SERVER-NAME>","transport":"http","url":"<MCP-URL>","oauth":{"mode":"dcr"}}]', $MCP_ARRAY_PLAIN)
 
     Set-Content $out_file $content
@@ -589,6 +610,10 @@ function Generate-Reg {
 
     $modelsJsonEscaped = $MODELS_JSON.Replace('"', '\"')
 
+    # The .reg format wraps values in double quotes, so any quote inside a JSON
+    # blob has to be backslash-escaped.
+    $claudeAiImportEscaped = $CLAUDE_AI_IMPORT.Replace('"', '\"')
+
     $content = Get-Content $REG_TEMPLATE -Raw
     $content = $content.Replace('<AIRIA-AI-GATEWAY>', $AIRIA_AI_GATEWAY)
     $content = $content.Replace('<AIRIA-GATEWAY-KEY>', $AIRIA_GATEWAY_KEY)
@@ -597,6 +622,7 @@ function Generate-Reg {
     $content = $content.Replace('<OTLP-API-KEY>', $OTLP_API_KEY)
     $content = $content.Replace('<USER-EMAIL>', $USER_EMAIL)
     $content = $content.Replace('<MODELS-JSON>', $modelsJsonEscaped)
+    $content = $content.Replace('<CLAUDE-AI-IMPORT>', $claudeAiImportEscaped)
     $content = $content.Replace('[{\"name\":\"<MCP-SERVER-NAME>\",\"transport\":\"http\",\"url\":\"<MCP-URL>\",\"oauth\":{\"mode\":\"dcr\"}}]', $mcpArrayEscaped)
 
     # Ensure standard Windows Registry UTF-16LE (with BOM) formatting

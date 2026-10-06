@@ -37,6 +37,8 @@
 				<string>[{"name":"<MCP-SERVER-NAME>","transport":"http","url":"<MCP-URL>","oauth":{"mode":"dcr"}}]</string>
 				<key>coworkEgressAllowedHosts</key>
 				<string>["*"]</string>
+				<key>claudeAiImport</key>
+				<string><CLAUDE-AI-IMPORT></string>
 				<key>disableDeploymentModeChooser</key>
 				<true/>
 				<key>inferenceProvider</key>

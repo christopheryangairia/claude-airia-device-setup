@@ -18,9 +18,10 @@
 #       Anthropic OAuth token (sk-ant-oat01-...), which the user must mint
 #       themselves by running `claude setup-token` locally (an interactive
 #       browser OAuth flow this script cannot automate) and paste in here.
-#     - Models are NOT auto-discovered — the user must manually enter the
+#     - Models are NOT auto-discovered — the user may optionally enter the
 #       model names to allow (matching the Allowed Models list configured
 #       on the Airia gateway side), plus whether each supports 1M context.
+#       Leaving the list empty omits inferenceModels from the config.
 #
 #   Steps:
 #     1. Ask for / infer the Airia region (from a BASE_URL like the one in
@@ -36,9 +37,9 @@
 #     6. Derive the OTLP endpoint from the same BASE_URL, and ask for the
 #        OTLP API key (X-API-Key header used for telemetry ingestion)
 #     7. Optionally ask for an MCP server name + URL to manage
-#     8. Ask the user to manually enter the list of discovered/allowed
-#        models (name + whether it supports 1M context), one at a time,
-#        then confirm the final list
+#     8. Optionally ask the user to enter the list of allowed models
+#        (name + whether it supports 1M context), one at a time, then
+#        confirm the final list (empty = omit inferenceModels)
 #     9. Ask whether users may import/export their Claude data
 #     10. Fill in the Windows (.reg) and/or macOS (.mobileconfig) config
 #        template with all of the above
@@ -460,21 +461,35 @@ echo ""
 echo "------------------------------------------------------------"
 echo " Claude long-lived token (Anthropic OAuth token)"
 echo "------------------------------------------------------------"
-echo "This script cannot mint this token for you — it requires an interactive"
-echo "local browser OAuth flow. On the END USER's own machine (not over plain"
-echo "SSH — the OAuth callback targets localhost), have them run:"
-echo ""
-echo "    claude setup-token"
-echo ""
-echo "This opens claude.ai/oauth/authorize (scope: user:inference, PKCE flow)."
-echo "They must approve while signed in to the correct plan account"
-echo "(Pro/Max/Team/Enterprise). The CLI then prints a long-lived (~1 year)"
-echo "token that looks like: sk-ant-oat01-..."
-echo ""
-echo "Security note: treat this token like a password. Anyone holding it can"
-echo "consume the user's plan quota. Do not commit it to source control."
-echo ""
-read -rp "Paste the user's sk-ant-oat01-... token: " CLAUDE_LONGLIVED_TOKEN
+ENV_LONGLIVED_TOKEN="${ANTHROPIC_LONG_LIVED_TOKEN:-}"
+if [[ -n "${ENV_LONGLIVED_TOKEN}" ]]; then
+  # Token supplied via .env / environment — confirm before using it, since it
+  # bills whichever plan account it was minted for.
+  echo "Found ANTHROPIC_LONG_LIVED_TOKEN in .env / environment:"
+  echo "    ${ENV_LONGLIVED_TOKEN:0:13}...${ENV_LONGLIVED_TOKEN: -4}"
+  echo "Make sure it belongs to ${USER_EMAIL}'s plan account — usage is billed"
+  echo "to whoever minted it."
+  echo ""
+  read -rp "Press Enter to use it, or paste a different sk-ant-oat01-... token: " TOKEN_OVERRIDE
+  CLAUDE_LONGLIVED_TOKEN="${TOKEN_OVERRIDE:-${ENV_LONGLIVED_TOKEN}}"
+else
+  echo "This script cannot mint this token for you — it requires an interactive"
+  echo "local browser OAuth flow. On the END USER's own machine (not over plain"
+  echo "SSH — the OAuth callback targets localhost), have them run:"
+  echo ""
+  echo "    claude setup-token"
+  echo ""
+  echo "This opens claude.ai/oauth/authorize (scope: user:inference, PKCE flow)."
+  echo "They must approve while signed in to the correct plan account"
+  echo "(Pro/Max/Team/Enterprise). The CLI then prints a long-lived (~1 year)"
+  echo "token that looks like: sk-ant-oat01-..."
+  echo ""
+  echo "Security note: treat this token like a password. Anyone holding it can"
+  echo "consume the user's plan quota. Do not commit it to source control."
+  echo "Tip: set ANTHROPIC_LONG_LIVED_TOKEN in .env to skip pasting it here."
+  echo ""
+  read -rp "Paste the user's sk-ant-oat01-... token: " CLAUDE_LONGLIVED_TOKEN
+fi
 if [[ -z "${CLAUDE_LONGLIVED_TOKEN}" ]]; then
   echo "Error: the Claude long-lived token is required." >&2
   exit 1
@@ -526,10 +541,11 @@ fi
 echo ""
 
 # -----------------------------------------------------------------------------
-# 8. Manually entered model list (inferenceModels)
+# 8. Optional manually entered model list (inferenceModels)
 #    User Impersonation does not auto-discover models — the models entered
 #    here must match the Allowed Models list configured on the Airia gateway
-#    side (an empty allow-list there means "allow all").
+#    side (an empty allow-list there means "allow all"). If no models are
+#    entered, the inferenceModels key is left out of the generated config.
 # -----------------------------------------------------------------------------
 echo "------------------------------------------------------------"
 echo " Model list (inferenceModels)"
@@ -537,17 +553,25 @@ echo "------------------------------------------------------------"
 echo "Enter the models Claude Desktop should offer. These must match the"
 echo "Allowed Models list configured on the Airia gateway side. Remember to"
 echo "include claude-haiku-4-5 (used for background tasks)."
+echo "Optional: press Enter without a model name to skip the model list."
 echo ""
 
 MODELS_JSON_ITEMS=()
 MODELS_SUMMARY=()
+
+show_models() {
+  echo "Current model list:"
+  if [[ ${#MODELS_SUMMARY[@]} -eq 0 ]]; then
+    echo "  (none — inferenceModels will be omitted)"
+  else
+    printf '%s\n' "${MODELS_SUMMARY[@]}"
+  fi
+  echo ""
+}
+
 while true; do
   read -rp "Model name (e.g. claude-sonnet-4-6), or press Enter to stop adding models: " MODEL_NAME
   if [[ -z "${MODEL_NAME}" ]]; then
-    if [[ ${#MODELS_JSON_ITEMS[@]} -eq 0 ]]; then
-      echo "You must enter at least one model." >&2
-      continue
-    fi
     break
   fi
 
@@ -563,19 +587,12 @@ while true; do
   echo ""
 done
 
-echo "Current model list:"
-printf '%s\n' "${MODELS_SUMMARY[@]}"
-echo ""
+show_models
 
 while true; do
   read -rp "Confirm this is the final model list? [Y/n]: " CONFIRM_MODELS
   if [[ -z "${CONFIRM_MODELS}" || "${CONFIRM_MODELS}" =~ ^[Yy] ]]; then
-    if [[ ${#MODELS_JSON_ITEMS[@]} -eq 0 ]]; then
-      echo "You must have at least one model before confirming." >&2
-      echo "" >&2
-    else
-      break
-    fi
+    break
   fi
 
   read -rp "Add another model? (leave blank to just remove the last one and re-confirm) Model name: " EXTRA_MODEL
@@ -594,13 +611,16 @@ while true; do
   fi
 
   echo ""
-  echo "Current model list:"
-  printf '%s\n' "${MODELS_SUMMARY[@]}"
-  echo ""
+  show_models
 done
 
-MODELS_JSON="[$(IFS=,; echo "${MODELS_JSON_ITEMS[*]}")]"
-echo "Final inferenceModels: ${MODELS_JSON}"
+if [[ ${#MODELS_JSON_ITEMS[@]} -eq 0 ]]; then
+  MODELS_JSON=""
+  echo "No models entered — inferenceModels will be omitted from the config."
+else
+  MODELS_JSON="[$(IFS=,; echo "${MODELS_JSON_ITEMS[*]}")]"
+  echo "Final inferenceModels: ${MODELS_JSON}"
+fi
 echo ""
 
 # -----------------------------------------------------------------------------
@@ -655,6 +675,23 @@ replace_token() {
   ' "${file}" "${token}" "${value}"
 }
 
+# Deletes every line (or multi-line span) matching a Perl regex. Used to drop
+# the inferenceModels entry from a template when no models were entered.
+remove_pattern() {
+  local file="$1" pattern="$2"
+  perl -e '
+    my ($file, $pattern) = @ARGV;
+    open(my $fh, "<", $file) or die $!;
+    local $/;
+    my $content = <$fh>;
+    close $fh;
+    $content =~ s/$pattern//mg;
+    open(my $out, ">", $file) or die $!;
+    print $out $content;
+    close $out;
+  ' "${file}" "${pattern}"
+}
+
 if [[ "${MCP_ENABLED}" == "true" ]]; then
   MCP_ARRAY_PLAIN="[{\"name\":\"${MCP_NAME}\",\"transport\":\"http\",\"url\":\"${MCP_URL}\",\"oauth\":{\"mode\":\"dcr\"}}]"
 else
@@ -677,7 +714,11 @@ generate_mobileconfig() {
   replace_token "${out_file}" '<OTLP-ENDPOINT>' "${OTLP_ENDPOINT_BASE}"
   replace_token "${out_file}" '<OTLP-API-KEY>' "${OTLP_API_KEY}"
   replace_token "${out_file}" '<USER-EMAIL>' "${USER_EMAIL}"
-  replace_token "${out_file}" '<MODELS-JSON>' "${MODELS_JSON}"
+  if [[ -n "${MODELS_JSON}" ]]; then
+    replace_token "${out_file}" '<MODELS-JSON>' "${MODELS_JSON}"
+  else
+    remove_pattern "${out_file}" '^[ \t]*<key>inferenceModels</key>\r?\n[ \t]*<string><MODELS-JSON></string>\r?\n'
+  fi
   replace_token "${out_file}" '<CLAUDE-AI-IMPORT>' "${CLAUDE_AI_IMPORT}"
   replace_token "${out_file}" '[{"name":"<MCP-SERVER-NAME>","transport":"http","url":"<MCP-URL>","oauth":{"mode":"dcr"}}]' "${MCP_ARRAY_PLAIN}"
 
@@ -725,7 +766,11 @@ generate_reg() {
   replace_token "${tmp_utf8}" '<OTLP-ENDPOINT>' "${OTLP_ENDPOINT_BASE}"
   replace_token "${tmp_utf8}" '<OTLP-API-KEY>' "${OTLP_API_KEY}"
   replace_token "${tmp_utf8}" '<USER-EMAIL>' "${USER_EMAIL}"
-  replace_token "${tmp_utf8}" '<MODELS-JSON>' "${models_json_escaped}"
+  if [[ -n "${MODELS_JSON}" ]]; then
+    replace_token "${tmp_utf8}" '<MODELS-JSON>' "${models_json_escaped}"
+  else
+    remove_pattern "${tmp_utf8}" '^[ \t]*"inferenceModels"="<MODELS-JSON>"[ \t]*\r?\n'
+  fi
   replace_token "${tmp_utf8}" '<CLAUDE-AI-IMPORT>' "${claude_ai_import_escaped}"
   replace_token "${tmp_utf8}" '[{\"name\":\"<MCP-SERVER-NAME>\",\"transport\":\"http\",\"url\":\"<MCP-URL>\",\"oauth\":{\"mode\":\"dcr\"}}]' "${mcp_array_escaped}"
 

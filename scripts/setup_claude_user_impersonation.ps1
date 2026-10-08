@@ -16,9 +16,10 @@
 #       Anthropic OAuth token (sk-ant-oat01-...), which the user must mint
 #       themselves by running `claude setup-token` locally (an interactive
 #       browser OAuth flow this script cannot automate) and paste in here.
-#     - Models are NOT auto-discovered - the user must manually enter the
+#     - Models are NOT auto-discovered - the user may optionally enter the
 #       model names to allow (matching the Allowed Models list configured
 #       on the Airia gateway side), plus whether each supports 1M context.
+#       Leaving the list empty omits inferenceModels from the config.
 #
 #   Steps:
 #     1. Ask for / infer the Airia region (from a BASE_URL like the one in
@@ -32,8 +33,9 @@
 #     6. Derive the OTLP endpoint from the same BASE_URL, and ask for the
 #        OTLP API key (X-API-Key header used for telemetry ingestion)
 #     7. Optionally ask for an MCP server name + URL to manage
-#     8. Ask the user to manually enter the list of allowed models (name +
+#     8. Optionally ask the user to enter the list of allowed models (name +
 #        whether it supports 1M context), one at a time, then confirm
+#        (empty = omit inferenceModels)
 #     9. Ask whether users may import/export their Claude data
 #     10. Fill in the Windows (.reg) and/or macOS (.mobileconfig) config
 #        template with all of the above
@@ -47,7 +49,8 @@ $ROOT_DIR = Split-Path $SCRIPT_DIR -Parent
 $OUT_DIR = Join-Path $ROOT_DIR "generated"
 
 # Load environment variables from .env (if present). Keys should be named
-# `MINT_API_KEY` and `GATEWAY_CONFIGURATION_ID`. Values are set in-process.
+# `MINT_API_KEY` and `GATEWAY_CONFIGURATION_ID` (plus optional
+# `ANTHROPIC_LONG_LIVED_TOKEN`). Values are set in-process.
 $ENV_FILE = Join-Path $ROOT_DIR ".env"
 function Load-EnvFile {
     param($path)
@@ -388,20 +391,37 @@ Write-Host ""
 Write-Host "------------------------------------------------------------"
 Write-Host " Claude long-lived token (Anthropic OAuth token)"
 Write-Host "------------------------------------------------------------"
-Write-Host "This script cannot mint this token for you - it requires an interactive"
-Write-Host "local browser OAuth flow. On the END USER's own machine, have them run:"
-Write-Host ""
-Write-Host "    claude setup-token"
-Write-Host ""
-Write-Host "This opens claude.ai/oauth/authorize (scope: user:inference, PKCE flow)."
-Write-Host "They must approve while signed in to the correct plan account"
-Write-Host "(Pro/Max/Team/Enterprise). The CLI then prints a long-lived (~1 year)"
-Write-Host "token that looks like: sk-ant-oat01-..."
-Write-Host ""
-Write-Host "Security note: treat this token like a password. Anyone holding it can"
-Write-Host "consume the user's plan quota. Do not commit it to source control."
-Write-Host ""
-$CLAUDE_LONGLIVED_TOKEN = Read-Host "Paste the user's sk-ant-oat01-... token"
+$ENV_LONGLIVED_TOKEN = if ($env:ANTHROPIC_LONG_LIVED_TOKEN) { $env:ANTHROPIC_LONG_LIVED_TOKEN } else { "" }
+if ($ENV_LONGLIVED_TOKEN) {
+    # Token supplied via .env / environment - confirm before using it, since it
+    # bills whichever plan account it was minted for.
+    $maskedToken = if ($ENV_LONGLIVED_TOKEN.Length -gt 17) {
+        $ENV_LONGLIVED_TOKEN.Substring(0, 13) + "..." + $ENV_LONGLIVED_TOKEN.Substring($ENV_LONGLIVED_TOKEN.Length - 4)
+    } else { "(short value)" }
+    Write-Host "Found ANTHROPIC_LONG_LIVED_TOKEN in .env / environment:"
+    Write-Host "    $maskedToken"
+    Write-Host "Make sure it belongs to $USER_EMAIL's plan account - usage is billed"
+    Write-Host "to whoever minted it."
+    Write-Host ""
+    $TOKEN_OVERRIDE = Read-Host "Press Enter to use it, or paste a different sk-ant-oat01-... token"
+    $CLAUDE_LONGLIVED_TOKEN = if ([string]::IsNullOrWhiteSpace($TOKEN_OVERRIDE)) { $ENV_LONGLIVED_TOKEN } else { $TOKEN_OVERRIDE.Trim() }
+} else {
+    Write-Host "This script cannot mint this token for you - it requires an interactive"
+    Write-Host "local browser OAuth flow. On the END USER's own machine, have them run:"
+    Write-Host ""
+    Write-Host "    claude setup-token"
+    Write-Host ""
+    Write-Host "This opens claude.ai/oauth/authorize (scope: user:inference, PKCE flow)."
+    Write-Host "They must approve while signed in to the correct plan account"
+    Write-Host "(Pro/Max/Team/Enterprise). The CLI then prints a long-lived (~1 year)"
+    Write-Host "token that looks like: sk-ant-oat01-..."
+    Write-Host ""
+    Write-Host "Security note: treat this token like a password. Anyone holding it can"
+    Write-Host "consume the user's plan quota. Do not commit it to source control."
+    Write-Host "Tip: set ANTHROPIC_LONG_LIVED_TOKEN in .env to skip pasting it here."
+    Write-Host ""
+    $CLAUDE_LONGLIVED_TOKEN = Read-Host "Paste the user's sk-ant-oat01-... token"
+}
 if ([string]::IsNullOrWhiteSpace($CLAUDE_LONGLIVED_TOKEN)) {
     Write-Host "Error: the Claude long-lived token is required." -ForegroundColor Red
     Read-Host "Press Enter to exit"
@@ -456,10 +476,11 @@ if ($MCP_CHOICE -match '^[Yy]') {
 Write-Host ""
 
 # -----------------------------------------------------------------------------
-# 8. Manually entered model list (inferenceModels)
+# 8. Optional manually entered model list (inferenceModels)
 #    User Impersonation does not auto-discover models - the models entered
 #    here must match the Allowed Models list configured on the Airia gateway
-#    side (an empty allow-list there means "allow all").
+#    side (an empty allow-list there means "allow all"). If no models are
+#    entered, the inferenceModels key is left out of the generated config.
 # -----------------------------------------------------------------------------
 Write-Host "------------------------------------------------------------"
 Write-Host " Model list (inferenceModels)"
@@ -467,6 +488,7 @@ Write-Host "------------------------------------------------------------"
 Write-Host "Enter the models Claude Desktop should offer. These must match the"
 Write-Host "Allowed Models list configured on the Airia gateway side. Remember to"
 Write-Host "include claude-haiku-4-5 (used for background tasks)."
+Write-Host "Optional: press Enter without a model name to skip the model list."
 Write-Host ""
 
 $Models = @()
@@ -474,7 +496,7 @@ $Models = @()
 function Show-Models {
     Write-Host "Current model list:"
     if ($Models.Count -eq 0) {
-        Write-Host "  (none yet)"
+        Write-Host "  (none - inferenceModels will be omitted)"
     } else {
         foreach ($m in $Models) {
             Write-Host "  - $($m.name) (supports1m: $($m.supports1m.ToString().ToLower()))"
@@ -486,10 +508,6 @@ function Show-Models {
 while ($true) {
     $ModelName = Read-Host "Model name (e.g. claude-sonnet-4-6), or press Enter to stop adding models"
     if ([string]::IsNullOrWhiteSpace($ModelName)) {
-        if ($Models.Count -eq 0) {
-            Write-Host "You must enter at least one model." -ForegroundColor Red
-            continue
-        }
         break
     }
 
@@ -505,12 +523,7 @@ Show-Models
 while ($true) {
     $ConfirmModels = Read-Host "Confirm this is the final model list? [Y/n]"
     if ([string]::IsNullOrWhiteSpace($ConfirmModels) -or $ConfirmModels -match '^[Yy]') {
-        if ($Models.Count -eq 0) {
-            Write-Host "You must have at least one model before confirming." -ForegroundColor Red
-            Write-Host ""
-        } else {
-            break
-        }
+        break
     }
 
     $ExtraModel = Read-Host "Add another model? (leave blank to just remove the last one and re-confirm) Model name"
@@ -527,9 +540,14 @@ while ($true) {
     Show-Models
 }
 
-$ModelsJsonItems = $Models | ForEach-Object { '{"name":"' + $_.name + '","supports1m":' + $_.supports1m.ToString().ToLower() + '}' }
-$MODELS_JSON = '[' + ($ModelsJsonItems -join ',') + ']'
-Write-Host "Final inferenceModels: $MODELS_JSON"
+if ($Models.Count -eq 0) {
+    $MODELS_JSON = ''
+    Write-Host "No models entered - inferenceModels will be omitted from the config."
+} else {
+    $ModelsJsonItems = $Models | ForEach-Object { '{"name":"' + $_.name + '","supports1m":' + $_.supports1m.ToString().ToLower() + '}' }
+    $MODELS_JSON = '[' + ($ModelsJsonItems -join ',') + ']'
+    Write-Host "Final inferenceModels: $MODELS_JSON"
+}
 Write-Host ""
 
 # -----------------------------------------------------------------------------
@@ -587,7 +605,11 @@ function Generate-MobileConfig {
     $content = $content.Replace('<OTLP-ENDPOINT>', $OTLP_ENDPOINT_BASE)
     $content = $content.Replace('<OTLP-API-KEY>', $OTLP_API_KEY)
     $content = $content.Replace('<USER-EMAIL>', $USER_EMAIL)
-    $content = $content.Replace('<MODELS-JSON>', $MODELS_JSON)
+    if ($MODELS_JSON) {
+        $content = $content.Replace('<MODELS-JSON>', $MODELS_JSON)
+    } else {
+        $content = $content -replace '(?m)^[ \t]*<key>inferenceModels</key>\r?\n[ \t]*<string><MODELS-JSON></string>\r?\n', ''
+    }
     $content = $content.Replace('<CLAUDE-AI-IMPORT>', $CLAUDE_AI_IMPORT)
     $content = $content.Replace('[{"name":"<MCP-SERVER-NAME>","transport":"http","url":"<MCP-URL>","oauth":{"mode":"dcr"}}]', $MCP_ARRAY_PLAIN)
 
@@ -621,7 +643,11 @@ function Generate-Reg {
     $content = $content.Replace('<OTLP-ENDPOINT>', $OTLP_ENDPOINT_BASE)
     $content = $content.Replace('<OTLP-API-KEY>', $OTLP_API_KEY)
     $content = $content.Replace('<USER-EMAIL>', $USER_EMAIL)
-    $content = $content.Replace('<MODELS-JSON>', $modelsJsonEscaped)
+    if ($MODELS_JSON) {
+        $content = $content.Replace('<MODELS-JSON>', $modelsJsonEscaped)
+    } else {
+        $content = $content -replace '(?m)^[ \t]*"inferenceModels"="<MODELS-JSON>"[ \t]*\r?\n', ''
+    }
     $content = $content.Replace('<CLAUDE-AI-IMPORT>', $claudeAiImportEscaped)
     $content = $content.Replace('[{\"name\":\"<MCP-SERVER-NAME>\",\"transport\":\"http\",\"url\":\"<MCP-URL>\",\"oauth\":{\"mode\":\"dcr\"}}]', $mcpArrayEscaped)
 

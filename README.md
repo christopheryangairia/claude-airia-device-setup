@@ -372,7 +372,7 @@ Troubleshooting table in the PDF.
    `Authorization: Bearer` rather than `x-api-key`.
 4. **New step: manual model list.** Since model discovery doesn't work the
    same way in this mode, the script loops asking for model names one at a
-   time (e.g. `claude-sonnet-4-6`, an Opus model, and `claude-haiku-4-5`,
+   time (e.g. `claude-sonnet-4-6`, an Opus model, and `claude-haiku-5-5`,
    which is required for background tasks) plus whether each supports 1M
    context (`supports1m`, written as an explicit `true`/`false`). These
    must match the Allowed Models list configured on the Airia gateway side
@@ -397,7 +397,7 @@ Troubleshooting table in the PDF.
 | `<AIRIA-GATEWAY-KEY>` | The gateway key from the key acquisition step — reused from an existing key or freshly minted via `/v1/GatewayApiKey` (same logic as the default flow's step 5/6) | Written into `inferenceCustomHeaders` as `{"x-airia-key":"..."}`. Authenticates to Airia / identifies the tenant config. |
 | `<CLAUDE-LONGLIVED-TOKEN>` | The user's own `sk-ant-oat01-...` token, pasted at the "Claude long-lived token" prompt ("What's different" item 2 above) | Written into `inferenceGatewayApiKey`. Authenticates to Anthropic and bills the user's own plan seat. Sent as `Authorization: Bearer` (see `inferenceGatewayAuthScheme`, fixed to `"bearer"` in the template). |
 | `<OTLP-ENDPOINT>` / `<OTLP-API-KEY>` / `<USER-EMAIL>` | Same as the default flow | Telemetry wiring — unchanged from `scripts/setup_claude_gateway.sh`/`.ps1`. |
-| `<MODELS-JSON>` | The confirmed model list from the manual model list step ("What's different" item 4 above), e.g. `[{"name":"claude-sonnet-4-6","supports1m":false},{"name":"claude-haiku-4-5","supports1m":false}]` | Written into `inferenceModels`. Must match the Allowed Models list on the Airia gateway side. |
+| `<MODELS-JSON>` | The confirmed model list from the manual model list step ("What's different" item 4 above), e.g. `[{"name":"claude-sonnet-4-6","supports1m":false},{"name":"claude-haiku-5-5","supports1m":false}]` | Written into `inferenceModels`. Must match the Allowed Models list on the Airia gateway side. |
 | `<MCP-SERVER-NAME>` / `<MCP-URL>` | Same as the default flow | `managedMcpServers`, or `[]` if declined. |
 | `<CLAUDE-AI-IMPORT>` | Same as the default flow | `claudeAiImport` — the data import/export policy blob. See the [default placeholder reference](#3-placeholder-reference) for the four sub-fields. |
 

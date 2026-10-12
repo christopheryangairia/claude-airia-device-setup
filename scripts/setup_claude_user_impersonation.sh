@@ -552,7 +552,7 @@ echo " Model list (inferenceModels)"
 echo "------------------------------------------------------------"
 echo "Enter the models Claude Desktop should offer. These must match the"
 echo "Allowed Models list configured on the Airia gateway side. Remember to"
-echo "include claude-haiku-4-5 (used for background tasks)."
+echo "include claude-haiku-5-5 (used for background tasks)."
 echo "Optional: press Enter without a model name to skip the model list."
 echo ""
 

@@ -487,7 +487,7 @@ Write-Host " Model list (inferenceModels)"
 Write-Host "------------------------------------------------------------"
 Write-Host "Enter the models Claude Desktop should offer. These must match the"
 Write-Host "Allowed Models list configured on the Airia gateway side. Remember to"
-Write-Host "include claude-haiku-4-5 (used for background tasks)."
+Write-Host "include claude-haiku-5-5 (used for background tasks)."
 Write-Host "Optional: press Enter without a model name to skip the model list."
 Write-Host ""
 

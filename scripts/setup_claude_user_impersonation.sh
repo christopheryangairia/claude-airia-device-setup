@@ -31,9 +31,10 @@
 #     3. Ask for the user's email address
 #     4. Request a personal Gateway API key from Airia (User key type) using
 #        that email — this becomes the `x-airia-key` custom header value
-#     5. Ask for the user's Claude long-lived token (sk-ant-oat01-...,
-#        minted locally via `claude setup-token`) — this becomes
-#        inferenceGatewayApiKey
+#     5. Choose how the user's Claude long-lived token is provided: the
+#        credential helper (helpers/, the user signs in once on first launch
+#        and nothing is collected here), or a sk-ant-oat01-... token the user
+#        minted with `claude setup-token`, which becomes inferenceGatewayApiKey
 #     6. Derive the OTLP endpoint from the same BASE_URL, and ask for the
 #        OTLP API key (X-API-Key header used for telemetry ingestion)
 #     7. Optionally ask for an MCP server name + URL to manage
@@ -57,6 +58,8 @@ OUT_DIR="${ROOT_DIR}/generated"
 
 REG_TEMPLATE="${ROOT_DIR}/templates/Claude_user_impersonation.reg"
 MOBILECONFIG_TEMPLATE="${ROOT_DIR}/templates/Claude_user_impersonation.mobileconfig"
+REG_HELPER_FRAGMENT="${ROOT_DIR}/templates/helper_script.reg.fragment"
+MOBILECONFIG_HELPER_FRAGMENT="${ROOT_DIR}/templates/helper_script.mobileconfig.fragment"
 
 # -----------------------------------------------------------------------------
 # Fixed admin credentials used only to mint the Airia gateway key that goes
@@ -455,49 +458,81 @@ fi
 echo ""
 
 # -----------------------------------------------------------------------------
-# 5. Ask for the user's Claude long-lived token (goes into
-#    inferenceGatewayApiKey, sent as Authorization: Bearer)
+# 5. The user's Claude long-lived token: the credential helper mints it on
+#    the device, or a pasted token goes into inferenceGatewayApiKey (sent as
+#    Authorization: Bearer)
 # -----------------------------------------------------------------------------
 echo "------------------------------------------------------------"
 echo " Claude long-lived token (Anthropic OAuth token)"
 echo "------------------------------------------------------------"
-ENV_LONGLIVED_TOKEN="${ANTHROPIC_LONG_LIVED_TOKEN:-}"
-if [[ -n "${ENV_LONGLIVED_TOKEN}" ]]; then
-  # Token supplied via .env / environment — confirm before using it, since it
-  # bills whichever plan account it was minted for.
-  echo "Found ANTHROPIC_LONG_LIVED_TOKEN in .env / environment:"
-  echo "    ${ENV_LONGLIVED_TOKEN:0:13}...${ENV_LONGLIVED_TOKEN: -4}"
-  echo "Make sure it belongs to ${USER_EMAIL}'s plan account — usage is billed"
-  echo "to whoever minted it."
-  echo ""
-  read -rp "Press Enter to use it, or paste a different sk-ant-oat01-... token: " TOKEN_OVERRIDE
-  CLAUDE_LONGLIVED_TOKEN="${TOKEN_OVERRIDE:-${ENV_LONGLIVED_TOKEN}}"
+# Credential helper (default): Claude Desktop runs helpers/<platform>/ on first
+# launch, the helper runs `claude setup-token` itself, the user approves once
+# in the browser, and the token is stored on their device (Keychain / DPAPI).
+# Static: paste a token the user already minted, as before.
+TOKEN_MODE="${CLAUDE_TOKEN_MODE:-}"
+if [[ -z "${TOKEN_MODE}" ]]; then
+  if [[ -n "${ANTHROPIC_LONG_LIVED_TOKEN:-}" ]]; then
+    TOKEN_MODE="static"
+  else
+    echo "How should this user's Claude token be provided?"
+    echo "  1) Credential helper (recommended): the user signs in once in the"
+    echo "     browser on first launch of Claude Desktop. Nothing to collect now."
+    echo "  2) Paste a token the user already minted with 'claude setup-token'"
+    read -rp "Choose [1/2] (default 1): " TOKEN_MODE_CHOICE
+    if [[ "${TOKEN_MODE_CHOICE:-1}" == "2" ]]; then TOKEN_MODE="static"; else TOKEN_MODE="helper"; fi
+  fi
+fi
+
+CLAUDE_LONGLIVED_TOKEN=""
+if [[ "${TOKEN_MODE}" == "helper" ]]; then
+  echo "Using the credential helper. Before the user first opens Claude Desktop,"
+  echo "install it on their machine (MDM or by hand):"
+  echo "    macOS:   helpers/macos/airia-claude-cred-helper -> /usr/local/bin/ (mode 755)"
+  echo "    Windows: helpers/windows/airia-claude-cred-helper.ps1 -> C:\\Program Files\\Airia\\"
+  echo "If the Airia browser extension warns or blocks claude.ai, allow"
+  echo "claude.ai/oauth/* or the one-time sign-in will stall on the warning page."
+elif [[ "${TOKEN_MODE}" == "static" ]]; then
+  ENV_LONGLIVED_TOKEN="${ANTHROPIC_LONG_LIVED_TOKEN:-}"
+  if [[ -n "${ENV_LONGLIVED_TOKEN}" ]]; then
+    # Token supplied via .env / environment — confirm before using it, since it
+    # bills whichever plan account it was minted for.
+    echo "Found ANTHROPIC_LONG_LIVED_TOKEN in .env / environment:"
+    echo "    ${ENV_LONGLIVED_TOKEN:0:13}...${ENV_LONGLIVED_TOKEN: -4}"
+    echo "Make sure it belongs to ${USER_EMAIL}'s plan account — usage is billed"
+    echo "to whoever minted it."
+    echo ""
+    read -rp "Press Enter to use it, or paste a different sk-ant-oat01-... token: " TOKEN_OVERRIDE
+    CLAUDE_LONGLIVED_TOKEN="${TOKEN_OVERRIDE:-${ENV_LONGLIVED_TOKEN}}"
+  else
+    echo "This script cannot mint this token for you — it requires an interactive"
+    echo "local browser OAuth flow. On the END USER's own machine (not over plain"
+    echo "SSH — the OAuth callback targets localhost), have them run:"
+    echo ""
+    echo "    claude setup-token"
+    echo ""
+    echo "This opens claude.ai/oauth/authorize (scope: user:inference, PKCE flow)."
+    echo "They must approve while signed in to the correct plan account"
+    echo "(Pro/Max/Team/Enterprise). The CLI then prints a long-lived (~1 year)"
+    echo "token that looks like: sk-ant-oat01-..."
+    echo ""
+    echo "Security note: treat this token like a password. Anyone holding it can"
+    echo "consume the user's plan quota. Do not commit it to source control."
+    echo "Tip: set ANTHROPIC_LONG_LIVED_TOKEN in .env to skip pasting it here."
+    echo ""
+    read -rp "Paste the user's sk-ant-oat01-... token: " CLAUDE_LONGLIVED_TOKEN
+  fi
+  if [[ -z "${CLAUDE_LONGLIVED_TOKEN}" ]]; then
+    echo "Error: the Claude long-lived token is required." >&2
+    exit 1
+  fi
+  if [[ "${CLAUDE_LONGLIVED_TOKEN}" != sk-ant-oat01-* ]]; then
+    echo "Warning: this doesn't look like a sk-ant-oat01-... token. Continuing" >&2
+    echo "anyway, but double check you didn't paste the ?code=... value or the" >&2
+    echo "Airia gateway key by mistake." >&2
+  fi
 else
-  echo "This script cannot mint this token for you — it requires an interactive"
-  echo "local browser OAuth flow. On the END USER's own machine (not over plain"
-  echo "SSH — the OAuth callback targets localhost), have them run:"
-  echo ""
-  echo "    claude setup-token"
-  echo ""
-  echo "This opens claude.ai/oauth/authorize (scope: user:inference, PKCE flow)."
-  echo "They must approve while signed in to the correct plan account"
-  echo "(Pro/Max/Team/Enterprise). The CLI then prints a long-lived (~1 year)"
-  echo "token that looks like: sk-ant-oat01-..."
-  echo ""
-  echo "Security note: treat this token like a password. Anyone holding it can"
-  echo "consume the user's plan quota. Do not commit it to source control."
-  echo "Tip: set ANTHROPIC_LONG_LIVED_TOKEN in .env to skip pasting it here."
-  echo ""
-  read -rp "Paste the user's sk-ant-oat01-... token: " CLAUDE_LONGLIVED_TOKEN
-fi
-if [[ -z "${CLAUDE_LONGLIVED_TOKEN}" ]]; then
-  echo "Error: the Claude long-lived token is required." >&2
+  echo "Error: CLAUDE_TOKEN_MODE must be 'helper' or 'static' (got '${TOKEN_MODE}')." >&2
   exit 1
-fi
-if [[ "${CLAUDE_LONGLIVED_TOKEN}" != sk-ant-oat01-* ]]; then
-  echo "Warning: this doesn't look like a sk-ant-oat01-... token. Continuing" >&2
-  echo "anyway, but double check you didn't paste the ?code=... value or the" >&2
-  echo "Airia gateway key by mistake." >&2
 fi
 echo ""
 
@@ -710,7 +745,12 @@ generate_mobileconfig() {
 
   replace_token "${out_file}" '<AIRIA-AI-GATEWAY>' "${AIRIA_AI_GATEWAY}"
   replace_token "${out_file}" '<AIRIA-GATEWAY-KEY>' "${AIRIA_GATEWAY_KEY}"
-  replace_token "${out_file}" '<CLAUDE-LONGLIVED-TOKEN>' "${CLAUDE_LONGLIVED_TOKEN}"
+  if [[ "${TOKEN_MODE}" == "helper" ]]; then
+    remove_pattern "${out_file}" '^[ \t]*<key>inferenceGatewayApiKey</key>\r?\n[ \t]*<string><CLAUDE-LONGLIVED-TOKEN></string>\r?\n'
+    replace_token "${out_file}" '<string>static</string>' "$(cat "${MOBILECONFIG_HELPER_FRAGMENT}")"
+  else
+    replace_token "${out_file}" '<CLAUDE-LONGLIVED-TOKEN>' "${CLAUDE_LONGLIVED_TOKEN}"
+  fi
   replace_token "${out_file}" '<OTLP-ENDPOINT>' "${OTLP_ENDPOINT_BASE}"
   replace_token "${out_file}" '<OTLP-API-KEY>' "${OTLP_API_KEY}"
   replace_token "${out_file}" '<USER-EMAIL>' "${USER_EMAIL}"
@@ -762,7 +802,12 @@ generate_reg() {
 
   replace_token "${tmp_utf8}" '<AIRIA-AI-GATEWAY>' "${AIRIA_AI_GATEWAY}"
   replace_token "${tmp_utf8}" '<AIRIA-GATEWAY-KEY>' "${AIRIA_GATEWAY_KEY}"
-  replace_token "${tmp_utf8}" '<CLAUDE-LONGLIVED-TOKEN>' "${CLAUDE_LONGLIVED_TOKEN}"
+  if [[ "${TOKEN_MODE}" == "helper" ]]; then
+    remove_pattern "${tmp_utf8}" '^[ \t]*"inferenceGatewayApiKey"="<CLAUDE-LONGLIVED-TOKEN>"[ \t]*\r?\n'
+    replace_token "${tmp_utf8}" '"inferenceCredentialKind"="static"' "$(cat "${REG_HELPER_FRAGMENT}")"
+  else
+    replace_token "${tmp_utf8}" '<CLAUDE-LONGLIVED-TOKEN>' "${CLAUDE_LONGLIVED_TOKEN}"
+  fi
   replace_token "${tmp_utf8}" '<OTLP-ENDPOINT>' "${OTLP_ENDPOINT_BASE}"
   replace_token "${tmp_utf8}" '<OTLP-API-KEY>' "${OTLP_API_KEY}"
   replace_token "${tmp_utf8}" '<USER-EMAIL>' "${USER_EMAIL}"
@@ -801,8 +846,15 @@ esac
 echo ""
 echo "============================================================"
 echo " Done."
-echo " These file(s) contain live credentials (Airia gateway key and"
-echo " the user's Anthropic long-lived token) — treat them like"
-echo " passwords. Do not commit them to source control or share"
+if [[ "${TOKEN_MODE}" == "helper" ]]; then
+  echo " These file(s) contain a live credential (the Airia gateway key)."
+  echo " The user's Anthropic token is not in them; it is created on their"
+  echo " device at first launch. Still treat the files like passwords."
+else
+  echo " These file(s) contain live credentials (Airia gateway key and"
+  echo " the user's Anthropic long-lived token) — treat them like"
+  echo " passwords."
+fi
+echo " Do not commit them to source control or share"
 echo " them outside of delivering them to the intended user."
 echo "============================================================"

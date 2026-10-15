@@ -1,0 +1,6 @@
+"inferenceCredentialKind"="helper-script"
+"inferenceCredentialHelperWindows"="C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
+"inferenceCredentialHelperArgs"="[\"-NoProfile\",\"-NonInteractive\",\"-WindowStyle\",\"Hidden\",\"-ExecutionPolicy\",\"Bypass\",\"-File\",\"C:\\\\Program Files\\\\Airia\\\\airia-claude-cred-helper.ps1\"]"
+"inferenceCredentialHelperTimeoutSec"=dword:00000258
+"inferenceCredentialHelperTtlSec"=dword:00000e10
+"inferenceCredentialHelperSilentRefreshEnabled"=dword:00000001

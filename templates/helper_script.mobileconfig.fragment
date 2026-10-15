@@ -1,0 +1,9 @@
+<string>helper-script</string>
+				<key>inferenceCredentialHelper</key>
+				<string>/usr/local/bin/airia-claude-cred-helper</string>
+				<key>inferenceCredentialHelperTimeoutSec</key>
+				<string>600</string>
+				<key>inferenceCredentialHelperTtlSec</key>
+				<string>3600</string>
+				<key>inferenceCredentialHelperSilentRefreshEnabled</key>
+				<string>true</string>

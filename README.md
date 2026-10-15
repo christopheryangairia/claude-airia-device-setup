@@ -36,7 +36,11 @@ different about Impersonation mode specifically.
 │   └── run_gateway.bat / run_user_impersonation.bat  ← direct-mode launchers
 ├── templates/                           ← .reg / .mobileconfig templates with placeholders
 │   ├── Claude.reg / Claude.mobileconfig
-│   └── Claude_user_impersonation.reg / Claude_user_impersonation.mobileconfig
+│   ├── Claude_user_impersonation.reg / Claude_user_impersonation.mobileconfig
+│   └── helper_script.reg.fragment / helper_script.mobileconfig.fragment  ← credential-helper keys
+├── helpers/                             ← credential helpers pushed to user machines (impersonation mode)
+│   ├── macos/airia-claude-cred-helper
+│   └── windows/airia-claude-cred-helper.ps1
 ├── generated/                           ← output lands here regardless of entry point
 └── docs/                                ← background PDF, etc.
 ```
@@ -360,13 +364,21 @@ Troubleshooting table in the PDF.
    `.env` — same admin values as the default script), but the result is
    written into the `x-airia-key` custom header instead of
    `inferenceGatewayApiKey`.
-2. **New prompt: the user's Claude long-lived token.** The script cannot
-   mint this — it requires an interactive local browser OAuth flow. The end
-   user must run `claude setup-token` themselves on their own machine (not
-   over plain SSH — the OAuth callback targets `localhost`), approve in the
-   browser while signed into the correct plan account, and paste the
-   resulting `sk-ant-oat01-...` token into the script's prompt. This becomes
-   `inferenceGatewayApiKey`.
+2. **New prompt: how the user's Claude long-lived token is provided.**
+   - **Credential helper (default, recommended).** Nothing is collected from
+     the user. The generated profile uses `inferenceCredentialKind:
+     helper-script` and points Claude Desktop at the helper in `helpers/`;
+     see [Credential helper](#credential-helper) below.
+   - **Static token.** The end user runs `claude setup-token` themselves on
+     their own machine (not over plain SSH — the OAuth callback targets
+     `localhost`), approves in the browser while signed into the correct plan
+     account, and the resulting `sk-ant-oat01-...` token is pasted into the
+     script's prompt. This becomes `inferenceGatewayApiKey`. This was the only
+     option before the helper and is still used automatically when
+     `ANTHROPIC_LONG_LIVED_TOKEN` is set.
+
+   Set `CLAUDE_TOKEN_MODE` to `helper` or `static` in `.env` to skip the
+   question.
 3. **`inferenceGatewayAuthScheme` is fixed to `"bearer"`** in the template
    (not a placeholder) — required so the token above travels as
    `Authorization: Bearer` rather than `x-api-key`.
@@ -395,11 +407,58 @@ Troubleshooting table in the PDF.
 |---|---|---|
 | `<AIRIA-AI-GATEWAY>` | The AI Gateway URL | Same as the default template — `inferenceGatewayBaseUrl` with `/anthropic` appended. |
 | `<AIRIA-GATEWAY-KEY>` | The gateway key from the key acquisition step — reused from an existing key or freshly minted via `/v1/GatewayApiKey` (same logic as the default flow's step 5/6) | Written into `inferenceCustomHeaders` as `{"x-airia-key":"..."}`. Authenticates to Airia / identifies the tenant config. |
-| `<CLAUDE-LONGLIVED-TOKEN>` | The user's own `sk-ant-oat01-...` token, pasted at the "Claude long-lived token" prompt ("What's different" item 2 above) | Written into `inferenceGatewayApiKey`. Authenticates to Anthropic and bills the user's own plan seat. Sent as `Authorization: Bearer` (see `inferenceGatewayAuthScheme`, fixed to `"bearer"` in the template). |
+| `<CLAUDE-LONGLIVED-TOKEN>` | Static mode: the user's own `sk-ant-oat01-...` token, pasted at the "Claude long-lived token" prompt ("What's different" item 2 above). Helper mode: the `inferenceGatewayApiKey` entry is removed and `inferenceCredentialKind` is replaced with the keys from `templates/helper_script.*.fragment` | Written into `inferenceGatewayApiKey`. Authenticates to Anthropic and bills the user's own plan seat. Sent as `Authorization: Bearer` (see `inferenceGatewayAuthScheme`, fixed to `"bearer"` in the template). |
 | `<OTLP-ENDPOINT>` / `<OTLP-API-KEY>` / `<USER-EMAIL>` | Same as the default flow | Telemetry wiring — unchanged from `scripts/setup_claude_gateway.sh`/`.ps1`. |
 | `<MODELS-JSON>` | The confirmed model list from the manual model list step ("What's different" item 4 above), e.g. `[{"name":"claude-sonnet-4-6","supports1m":false},{"name":"claude-haiku-5-5","supports1m":false}]` | Written into `inferenceModels`. Must match the Allowed Models list on the Airia gateway side. |
 | `<MCP-SERVER-NAME>` / `<MCP-URL>` | Same as the default flow | `managedMcpServers`, or `[]` if declined. |
 | `<CLAUDE-AI-IMPORT>` | Same as the default flow | `claudeAiImport` — the data import/export policy blob. See the [default placeholder reference](#3-placeholder-reference) for the four sub-fields. |
+
+### Credential helper
+
+Without the helper, every user has to run `claude setup-token` and hand the
+token back before the admin can finish their config. With it, the admin
+pushes the same profile shape and the same helper to every machine, and the
+user's only step is signing in once in the browser.
+
+How it works: on first launch Claude Desktop runs the helper. The helper finds
+no stored token, runs `claude setup-token` itself under a pseudo terminal
+(`script` on macOS, ConPTY on Windows), the browser opens, the user approves
+with their own Claude account, and the helper stores the 1-year token on the
+device: the login Keychain on macOS, DPAPI (current user) under
+`%LOCALAPPDATA%\Airia` on Windows. Later launches read it back without a
+browser. The helper also re-mints when the stored token is older than 350
+days or when Anthropic reports it revoked (checked with the free
+`count_tokens` endpoint).
+
+Install, before the user first opens Claude Desktop:
+
+| Platform | File | Install to |
+|---|---|---|
+| macOS | `helpers/macos/airia-claude-cred-helper` | `/usr/local/bin/airia-claude-cred-helper`, mode 755 |
+| Windows | `helpers/windows/airia-claude-cred-helper.ps1` | `C:\Program Files\Airia\airia-claude-cred-helper.ps1` |
+
+Neither helper contains secrets or per-user values. The per-user value that
+remains is the Airia gateway key in `x-airia-key`, which this script mints.
+
+Things to know:
+
+- **Sign-in time.** A first sign-in through SSO measured 272 seconds, so the
+  profile sets `inferenceCredentialHelperTimeoutSec` to 600, the maximum.
+  Claude Desktop stops waiting at its timeout but does not stop the helper,
+  so the helper gives up on its own at 570 seconds and is offered again on
+  the next launch.
+- **The browser can open behind Claude Desktop.** The chat shows "Running
+  credential helper…" until the sign-in finishes. Tell users to look for the
+  browser tab.
+- **Airia browser extension.** If the Shadow AI policy warns or blocks
+  claude.ai, allow `claude.ai/oauth/*` for these users, or the sign-in stops on
+  the extension's warning page.
+- **Claude Code CLI.** The helper uses the CLI's `setup-token` command and
+  installs the CLI if it isn't found. It reads the token from the command's
+  terminal output, which is not a documented interface, so a CLI update could
+  change it. Tested with Claude Code 2.1.283 and 2.1.299.
+- **Re-mint by hand:** `airia-claude-cred-helper --reset` (macOS) or run the
+  `.ps1` with `-Reset` (Windows), then relaunch Claude Desktop.
 
 Output files land in `./generated/` as `<INITIALS>_claude_impersonation.reg`
 / `<INITIALS>_claude_impersonation.mobileconfig` — same live-credential

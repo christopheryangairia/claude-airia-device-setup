@@ -28,8 +28,10 @@
 #     3. Ask for the user's email address
 #     4. Request a personal Gateway API key from Airia (User key type) using
 #        that email - becomes the x-airia-key custom header value
-#     5. Ask for the user's Claude long-lived token (sk-ant-oat01-...) -
-#        becomes inferenceGatewayApiKey
+#     5. Choose how the user's Claude long-lived token is provided: the
+#        credential helper (helpers\, the user signs in once on first launch
+#        and nothing is collected here), or a sk-ant-oat01-... token the user
+#        minted with `claude setup-token`, which becomes inferenceGatewayApiKey
 #     6. Derive the OTLP endpoint from the same BASE_URL, and ask for the
 #        OTLP API key (X-API-Key header used for telemetry ingestion)
 #     7. Optionally ask for an MCP server name + URL to manage
@@ -74,6 +76,8 @@ Load-EnvFile $ENV_FILE
 
 $REG_TEMPLATE = Join-Path $ROOT_DIR "templates/Claude_user_impersonation.reg"
 $MOBILECONFIG_TEMPLATE = Join-Path $ROOT_DIR "templates/Claude_user_impersonation.mobileconfig"
+$REG_HELPER_FRAGMENT = Join-Path $ROOT_DIR "templates/helper_script.reg.fragment"
+$MOBILECONFIG_HELPER_FRAGMENT = Join-Path $ROOT_DIR "templates/helper_script.mobileconfig.fragment"
 
 # -----------------------------------------------------------------------------
 # Fixed admin credentials used only to mint the Airia gateway key that goes
@@ -385,52 +389,85 @@ if (-not $GATEWAY_USER_ID) {
 Write-Host ""
 
 # -----------------------------------------------------------------------------
-# 5. Ask for the user's Claude long-lived token (goes into
-#    inferenceGatewayApiKey, sent as Authorization: Bearer)
+# 5. The user's Claude long-lived token: the credential helper mints it on
+#    the device, or a pasted token goes into inferenceGatewayApiKey (sent as
+#    Authorization: Bearer)
 # -----------------------------------------------------------------------------
 Write-Host "------------------------------------------------------------"
 Write-Host " Claude long-lived token (Anthropic OAuth token)"
 Write-Host "------------------------------------------------------------"
-$ENV_LONGLIVED_TOKEN = if ($env:ANTHROPIC_LONG_LIVED_TOKEN) { $env:ANTHROPIC_LONG_LIVED_TOKEN } else { "" }
-if ($ENV_LONGLIVED_TOKEN) {
-    # Token supplied via .env / environment - confirm before using it, since it
-    # bills whichever plan account it was minted for.
-    $maskedToken = if ($ENV_LONGLIVED_TOKEN.Length -gt 17) {
-        $ENV_LONGLIVED_TOKEN.Substring(0, 13) + "..." + $ENV_LONGLIVED_TOKEN.Substring($ENV_LONGLIVED_TOKEN.Length - 4)
-    } else { "(short value)" }
-    Write-Host "Found ANTHROPIC_LONG_LIVED_TOKEN in .env / environment:"
-    Write-Host "    $maskedToken"
-    Write-Host "Make sure it belongs to $USER_EMAIL's plan account - usage is billed"
-    Write-Host "to whoever minted it."
-    Write-Host ""
-    $TOKEN_OVERRIDE = Read-Host "Press Enter to use it, or paste a different sk-ant-oat01-... token"
-    $CLAUDE_LONGLIVED_TOKEN = if ([string]::IsNullOrWhiteSpace($TOKEN_OVERRIDE)) { $ENV_LONGLIVED_TOKEN } else { $TOKEN_OVERRIDE.Trim() }
-} else {
-    Write-Host "This script cannot mint this token for you - it requires an interactive"
-    Write-Host "local browser OAuth flow. On the END USER's own machine, have them run:"
-    Write-Host ""
-    Write-Host "    claude setup-token"
-    Write-Host ""
-    Write-Host "This opens claude.ai/oauth/authorize (scope: user:inference, PKCE flow)."
-    Write-Host "They must approve while signed in to the correct plan account"
-    Write-Host "(Pro/Max/Team/Enterprise). The CLI then prints a long-lived (~1 year)"
-    Write-Host "token that looks like: sk-ant-oat01-..."
-    Write-Host ""
-    Write-Host "Security note: treat this token like a password. Anyone holding it can"
-    Write-Host "consume the user's plan quota. Do not commit it to source control."
-    Write-Host "Tip: set ANTHROPIC_LONG_LIVED_TOKEN in .env to skip pasting it here."
-    Write-Host ""
-    $CLAUDE_LONGLIVED_TOKEN = Read-Host "Paste the user's sk-ant-oat01-... token"
+# Credential helper (default): Claude Desktop runs helpers\<platform>\ on first
+# launch, the helper runs `claude setup-token` itself, the user approves once
+# in the browser, and the token is stored on their device (Keychain / DPAPI).
+# Static: paste a token the user already minted, as before.
+$TOKEN_MODE = if ($env:CLAUDE_TOKEN_MODE) { $env:CLAUDE_TOKEN_MODE } else { "" }
+if (-not $TOKEN_MODE) {
+    if ($env:ANTHROPIC_LONG_LIVED_TOKEN) {
+        $TOKEN_MODE = "static"
+    } else {
+        Write-Host "How should this user's Claude token be provided?"
+        Write-Host "  1) Credential helper (recommended): the user signs in once in the"
+        Write-Host "     browser on first launch of Claude Desktop. Nothing to collect now."
+        Write-Host "  2) Paste a token the user already minted with 'claude setup-token'"
+        $tokenModeChoice = Read-Host "Choose [1/2] (default 1)"
+        $TOKEN_MODE = if ($tokenModeChoice -eq "2") { "static" } else { "helper" }
+    }
 }
-if ([string]::IsNullOrWhiteSpace($CLAUDE_LONGLIVED_TOKEN)) {
-    Write-Host "Error: the Claude long-lived token is required." -ForegroundColor Red
+
+$CLAUDE_LONGLIVED_TOKEN = ""
+if ($TOKEN_MODE -eq "helper") {
+    Write-Host "Using the credential helper. Before the user first opens Claude Desktop,"
+    Write-Host "install it on their machine (MDM or by hand):"
+    Write-Host "    macOS:   helpers/macos/airia-claude-cred-helper -> /usr/local/bin/ (mode 755)"
+    Write-Host "    Windows: helpers\windows\airia-claude-cred-helper.ps1 -> C:\Program Files\Airia\"
+    Write-Host "If the Airia browser extension warns or blocks claude.ai, allow"
+    Write-Host "claude.ai/oauth/* or the one-time sign-in will stall on the warning page."
+} elseif ($TOKEN_MODE -eq "static") {
+    $ENV_LONGLIVED_TOKEN = if ($env:ANTHROPIC_LONG_LIVED_TOKEN) { $env:ANTHROPIC_LONG_LIVED_TOKEN } else { "" }
+    if ($ENV_LONGLIVED_TOKEN) {
+        # Token supplied via .env / environment - confirm before using it, since it
+        # bills whichever plan account it was minted for.
+        $maskedToken = if ($ENV_LONGLIVED_TOKEN.Length -gt 17) {
+            $ENV_LONGLIVED_TOKEN.Substring(0, 13) + "..." + $ENV_LONGLIVED_TOKEN.Substring($ENV_LONGLIVED_TOKEN.Length - 4)
+        } else { "(short value)" }
+        Write-Host "Found ANTHROPIC_LONG_LIVED_TOKEN in .env / environment:"
+        Write-Host "    $maskedToken"
+        Write-Host "Make sure it belongs to $USER_EMAIL's plan account - usage is billed"
+        Write-Host "to whoever minted it."
+        Write-Host ""
+        $TOKEN_OVERRIDE = Read-Host "Press Enter to use it, or paste a different sk-ant-oat01-... token"
+        $CLAUDE_LONGLIVED_TOKEN = if ([string]::IsNullOrWhiteSpace($TOKEN_OVERRIDE)) { $ENV_LONGLIVED_TOKEN } else { $TOKEN_OVERRIDE.Trim() }
+    } else {
+        Write-Host "This script cannot mint this token for you - it requires an interactive"
+        Write-Host "local browser OAuth flow. On the END USER's own machine, have them run:"
+        Write-Host ""
+        Write-Host "    claude setup-token"
+        Write-Host ""
+        Write-Host "This opens claude.ai/oauth/authorize (scope: user:inference, PKCE flow)."
+        Write-Host "They must approve while signed in to the correct plan account"
+        Write-Host "(Pro/Max/Team/Enterprise). The CLI then prints a long-lived (~1 year)"
+        Write-Host "token that looks like: sk-ant-oat01-..."
+        Write-Host ""
+        Write-Host "Security note: treat this token like a password. Anyone holding it can"
+        Write-Host "consume the user's plan quota. Do not commit it to source control."
+        Write-Host "Tip: set ANTHROPIC_LONG_LIVED_TOKEN in .env to skip pasting it here."
+        Write-Host ""
+        $CLAUDE_LONGLIVED_TOKEN = Read-Host "Paste the user's sk-ant-oat01-... token"
+    }
+    if ([string]::IsNullOrWhiteSpace($CLAUDE_LONGLIVED_TOKEN)) {
+        Write-Host "Error: the Claude long-lived token is required." -ForegroundColor Red
+        Read-Host "Press Enter to exit"
+        Exit
+    }
+    if (-not $CLAUDE_LONGLIVED_TOKEN.StartsWith("sk-ant-oat01-")) {
+        Write-Host "Warning: this doesn't look like a sk-ant-oat01-... token. Continuing" -ForegroundColor Yellow
+        Write-Host "anyway, but double check you didn't paste the ?code=... value or the" -ForegroundColor Yellow
+        Write-Host "Airia gateway key by mistake." -ForegroundColor Yellow
+    }
+} else {
+    Write-Host "Error: CLAUDE_TOKEN_MODE must be 'helper' or 'static' (got '$TOKEN_MODE')." -ForegroundColor Red
     Read-Host "Press Enter to exit"
     Exit
-}
-if (-not $CLAUDE_LONGLIVED_TOKEN.StartsWith("sk-ant-oat01-")) {
-    Write-Host "Warning: this doesn't look like a sk-ant-oat01-... token. Continuing" -ForegroundColor Yellow
-    Write-Host "anyway, but double check you didn't paste the ?code=... value or the" -ForegroundColor Yellow
-    Write-Host "Airia gateway key by mistake." -ForegroundColor Yellow
 }
 Write-Host ""
 
@@ -601,7 +638,12 @@ function Generate-MobileConfig {
     $content = Get-Content $MOBILECONFIG_TEMPLATE -Raw
     $content = $content.Replace('<AIRIA-AI-GATEWAY>', $AIRIA_AI_GATEWAY)
     $content = $content.Replace('<AIRIA-GATEWAY-KEY>', $AIRIA_GATEWAY_KEY)
-    $content = $content.Replace('<CLAUDE-LONGLIVED-TOKEN>', $CLAUDE_LONGLIVED_TOKEN)
+    if ($TOKEN_MODE -eq "helper") {
+        $content = $content -replace '(?m)^[ \t]*<key>inferenceGatewayApiKey</key>\r?\n[ \t]*<string><CLAUDE-LONGLIVED-TOKEN></string>\r?\n', ''
+        $content = $content.Replace('<string>static</string>', (Get-Content $MOBILECONFIG_HELPER_FRAGMENT -Raw).TrimEnd())
+    } else {
+        $content = $content.Replace('<CLAUDE-LONGLIVED-TOKEN>', $CLAUDE_LONGLIVED_TOKEN)
+    }
     $content = $content.Replace('<OTLP-ENDPOINT>', $OTLP_ENDPOINT_BASE)
     $content = $content.Replace('<OTLP-API-KEY>', $OTLP_API_KEY)
     $content = $content.Replace('<USER-EMAIL>', $USER_EMAIL)
@@ -639,7 +681,12 @@ function Generate-Reg {
     $content = Get-Content $REG_TEMPLATE -Raw
     $content = $content.Replace('<AIRIA-AI-GATEWAY>', $AIRIA_AI_GATEWAY)
     $content = $content.Replace('<AIRIA-GATEWAY-KEY>', $AIRIA_GATEWAY_KEY)
-    $content = $content.Replace('<CLAUDE-LONGLIVED-TOKEN>', $CLAUDE_LONGLIVED_TOKEN)
+    if ($TOKEN_MODE -eq "helper") {
+        $content = $content -replace '(?m)^[ \t]*"inferenceGatewayApiKey"="<CLAUDE-LONGLIVED-TOKEN>"[ \t]*\r?\n', ''
+        $content = $content.Replace('"inferenceCredentialKind"="static"', (Get-Content $REG_HELPER_FRAGMENT -Raw).TrimEnd())
+    } else {
+        $content = $content.Replace('<CLAUDE-LONGLIVED-TOKEN>', $CLAUDE_LONGLIVED_TOKEN)
+    }
     $content = $content.Replace('<OTLP-ENDPOINT>', $OTLP_ENDPOINT_BASE)
     $content = $content.Replace('<OTLP-API-KEY>', $OTLP_API_KEY)
     $content = $content.Replace('<USER-EMAIL>', $USER_EMAIL)
@@ -670,9 +717,16 @@ switch ($PLATFORM_CHOICE) {
 Write-Host ""
 Write-Host "============================================================"
 Write-Host " Done."
-Write-Host " These file(s) contain live credentials (Airia gateway key and"
-Write-Host " the user's Anthropic long-lived token) - treat them like"
-Write-Host " passwords. Do not commit them to source control or share"
+if ($TOKEN_MODE -eq "helper") {
+    Write-Host " These file(s) contain a live credential (the Airia gateway key)."
+    Write-Host " The user's Anthropic token is not in them; it is created on their"
+    Write-Host " device at first launch. Still treat the files like passwords."
+} else {
+    Write-Host " These file(s) contain live credentials (Airia gateway key and"
+    Write-Host " the user's Anthropic long-lived token) - treat them like"
+    Write-Host " passwords."
+}
+Write-Host " Do not commit them to source control or share"
 Write-Host " them outside of delivering them to the intended user."
 Write-Host "============================================================"
 Read-Host "Press Enter to exit"

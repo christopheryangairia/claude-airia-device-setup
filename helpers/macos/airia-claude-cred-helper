@@ -1,0 +1,146 @@
+#!/bin/bash
+# airia-claude-cred-helper (macOS)
+#
+# Claude Desktop credential helper for an Airia AI Gateway in User Impersonation
+# mode. Pushed identically to every Mac by MDM; it carries no secrets and no
+# per-user values.
+#
+# First run on a machine: no token in the Keychain, so it runs
+# `claude setup-token` itself. The user's browser opens once, they approve with
+# their own Claude account, and the resulting 1-year token goes into the login
+# Keychain. Every later run just reads the Keychain.
+#
+# Desktop config (managed):
+#   inferenceProvider                     gateway
+#   inferenceGatewayAuthScheme            bearer
+#   inferenceCredentialKind               helper-script
+#   inferenceCredentialHelper             /usr/local/bin/airia-claude-cred-helper
+#   inferenceCredentialHelperTimeoutSec   600   (the maximum; an SSO sign-in can take
+#                                                 4-5 minutes, measured at 272s on a VM)
+#   inferenceCustomHeaders                {"x-airia-key":"agk-..."}
+#
+# Contract: Desktop reads a bare token from stdout. Diagnostics go to stderr.
+# Re-mint: `airia-claude-cred-helper --reset`, or delete the Keychain item.
+
+set -uo pipefail
+
+SERVICE="airia-claude-gateway-token"
+ACCOUNT="$(id -un)"
+MAX_AGE_DAYS=350
+MINT_TIMEOUT="${AIRIA_HELPER_MINT_TIMEOUT:-570}"   # keep below inferenceCredentialHelperTimeoutSec (600)
+LOCK="${TMPDIR:-/tmp}/airia-claude-cred-helper.lock"
+
+log() { echo "airia-claude-cred-helper: $*" >&2; }
+
+read_token() { security find-generic-password -s "$SERVICE" -a "$ACCOUNT" -w 2>/dev/null; }
+
+token_age_days() {
+  local mdat
+  mdat="$(security find-generic-password -s "$SERVICE" -a "$ACCOUNT" 2>/dev/null \
+    | sed -n 's/.*"mdat"<timedate>=0x[0-9A-F]* *"\([0-9]\{8\}\).*/\1/p')"
+  [ -n "$mdat" ] || { echo 0; return; }
+  echo $(( ( $(date +%s) - $(date -j -f %Y%m%d "$mdat" +%s) ) / 86400 ))
+}
+
+# Desktop re-runs the helper as soon as the gateway rejects a token, so a
+# revoked token would otherwise be handed back forever. count_tokens is free and
+# answers 401 only for a revoked or invalid token. Anything else, including no
+# route to api.anthropic.com, keeps the cached token; an unreachable result is
+# remembered for an hour so a gateway-only network doesn't pay the timeout on
+# every launch.
+token_revoked() {
+  local stamp="${TMPDIR:-/tmp}/airia-claude-cred-helper.unreachable" code
+  [ -f "$stamp" ] && [ $(( $(date +%s) - $(stat -f %m "$stamp") )) -lt 3600 ] && return 1
+  code="$(curl -s -m 4 -o /dev/null -w '%{http_code}' https://api.anthropic.com/v1/messages/count_tokens \
+    -H "authorization: Bearer $1" -H 'anthropic-beta: oauth-2025-04-20' -H 'anthropic-version: 2023-06-01' \
+    -H 'content-type: application/json' \
+    -d '{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"x"}]}')"
+  [ "$code" = 000 ] && touch "$stamp"
+  [ "$code" = 401 ]
+}
+
+find_claude() {
+  # Last entry: the copy Claude Desktop installs for its Code tab.
+  for c in "$(command -v claude 2>/dev/null)" "$HOME/.local/bin/claude" /usr/local/bin/claude /opt/homebrew/bin/claude \
+           "$(ls -t "$HOME/Library/Application Support/Claude-3p/claude-code"/*/*/claude 2>/dev/null | head -n 1)"; do
+    [ -n "$c" ] && [ -x "$c" ] && { echo "$c"; return 0; }
+  done
+  return 1
+}
+
+mint_token() {
+  local claude out tok
+  claude="$(find_claude)" || {
+    log "Claude Code CLI not found; installing it for setup-token"
+    curl -fsSL https://claude.ai/install.sh | bash >&2 || { log "install failed"; return 1; }
+    claude="$(find_claude)" || { log "claude still not on PATH after install"; return 1; }
+  }
+  out="$(mktemp "${TMPDIR:-/tmp}/acch.XXXXXX")"; chmod 600 "$out"
+  trap 'rm -f "$out"' RETURN
+  log "no gateway token on this Mac; opening the browser for a one-time Claude sign-in"
+  # setup-token needs a terminal; Desktop gives us none, so run it under a pty.
+  # When Desktop's own timeout fires it stops waiting but does not kill the
+  # helper, so an abandoned sign-in would hold the lock indefinitely. Give up
+  # first, below inferenceCredentialHelperTimeoutSec, and take setup-token with us.
+  COLUMNS=400 script -q "$out" "$claude" setup-token </dev/null >/dev/null 2>&1 &
+  local pid=$! waited=0
+  while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt "$MINT_TIMEOUT" ]; do sleep 1; waited=$((waited + 1)); done
+  if kill -0 "$pid" 2>/dev/null; then
+    log "sign-in not completed within ${MINT_TIMEOUT}s; it will be offered again on the next launch"
+    pkill -TERM -P "$pid" 2>/dev/null; kill -TERM "$pid" 2>/dev/null; sleep 1
+    pkill -KILL -P "$pid" 2>/dev/null; kill -KILL "$pid" 2>/dev/null
+  fi
+  wait "$pid" 2>/dev/null
+  tok="$(OUT="$out" /usr/bin/python3 - <<'PY'
+import os, re
+raw = open(os.environ["OUT"], "rb").read().decode("utf-8", "ignore")
+raw = re.sub(r"\x1b\][^\x07\x1b]*(\x07|\x1b\\)", "", raw)
+raw = re.sub(r"\x1b\[[0-9;?<>]*[A-Za-z~]", "", raw)
+raw = re.sub(r"\x1b[78()][A-Z0-9]?", "", raw)
+i = raw.rfind("sk-ant-oat01-")
+m = re.match(r"sk-ant-oat01-[A-Za-z0-9_\-\s]+?(?=Store|\Z)", raw[i:]) if i >= 0 else None
+print(re.sub(r"\s", "", m.group(0)) if m else "")
+PY
+)"
+  [ -n "$tok" ] || { log "sign-in did not complete (no token returned)"; return 1; }
+  security add-generic-password -U -s "$SERVICE" -a "$ACCOUNT" -w "$tok" \
+    -T /usr/bin/security >/dev/null || { log "could not write the Keychain"; return 1; }
+  log "token stored in the login Keychain ($SERVICE)"
+}
+
+if [ "${1:-}" = "--reset" ]; then
+  security delete-generic-password -s "$SERVICE" -a "$ACCOUNT" >/dev/null 2>&1
+  log "token removed; the next Claude Desktop launch signs in again"
+  exit 0
+fi
+
+tok="$(read_token)"
+if [ -n "$tok" ] && token_revoked "$tok"; then
+  log "stored token was revoked or is invalid; signing in again"
+  security delete-generic-password -s "$SERVICE" -a "$ACCOUNT" >/dev/null 2>&1
+  tok=""
+fi
+if [ -z "$tok" ] || [ "$(token_age_days)" -ge "$MAX_AGE_DAYS" ]; then
+  # One sign-in at a time; Desktop can call the helper from several places.
+  # A helper killed with SIGKILL never runs its EXIT trap, so a lock whose
+  # owner is gone is stale and gets taken over rather than waited on.
+  owner="$(cat "$LOCK/pid" 2>/dev/null)"
+  if [ -d "$LOCK" ] && { [ -z "$owner" ] || ! kill -0 "$owner" 2>/dev/null; }; then
+    rm -rf "$LOCK"
+  fi
+  if mkdir "$LOCK" 2>/dev/null; then
+    echo $$ > "$LOCK/pid"
+    trap 'rm -rf "$LOCK"' EXIT
+    mint_token || exit 1
+  else
+    for _ in $(seq 1 "$MINT_TIMEOUT"); do
+      sleep 1
+      [ -d "$LOCK" ] || break
+      kill -0 "$(cat "$LOCK/pid" 2>/dev/null)" 2>/dev/null || break
+    done
+  fi
+  tok="$(read_token)"
+fi
+
+[ -n "$tok" ] || { log "no token available"; exit 1; }
+printf '%s\n' "$tok"

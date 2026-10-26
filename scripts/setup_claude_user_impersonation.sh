@@ -60,6 +60,7 @@ REG_TEMPLATE="${ROOT_DIR}/templates/Claude_user_impersonation.reg"
 MOBILECONFIG_TEMPLATE="${ROOT_DIR}/templates/Claude_user_impersonation.mobileconfig"
 REG_HELPER_FRAGMENT="${ROOT_DIR}/templates/helper_script.reg.fragment"
 MOBILECONFIG_HELPER_FRAGMENT="${ROOT_DIR}/templates/helper_script.mobileconfig.fragment"
+KIT_TEMPLATE_DIR="${ROOT_DIR}/templates/kit"
 
 # -----------------------------------------------------------------------------
 # Fixed admin credentials used only to mint the Airia gateway key that goes
@@ -485,8 +486,8 @@ fi
 
 CLAUDE_LONGLIVED_TOKEN=""
 if [[ "${TOKEN_MODE}" == "helper" ]]; then
-  echo "Using the credential helper. Before the user first opens Claude Desktop,"
-  echo "install it on their machine (MDM or by hand):"
+  echo "Using the credential helper. The output is a zip kit for the user with"
+  echo "the helper, an installer and instructions. To push it by MDM instead:"
   echo "    macOS:   helpers/macos/airia-claude-cred-helper -> /usr/local/bin/ (mode 755)"
   echo "    Windows: helpers/windows/airia-claude-cred-helper.ps1 -> C:\\Program Files\\Airia\\"
   echo "If the Airia browser extension warns or blocks claude.ai, allow"
@@ -686,6 +687,19 @@ echo "  2) macOS (.mobileconfig)"
 echo "  3) Both"
 read -rp "Choose [1/2/3]: " PLATFORM_CHOICE
 
+# Helper mode packages everything the user needs (profile, helper, installer,
+# instructions) into generated/<INITIALS>_claude_impersonation/ plus a .zip of
+# it, so the admin hands over one file. Static mode writes the bare config(s).
+MOBILECONFIG_OUT_DIR="${OUT_DIR}"
+REG_OUT_DIR="${OUT_DIR}"
+if [[ "${TOKEN_MODE}" == "helper" ]]; then
+  KIT_NAME="${INITIALS}_claude_impersonation"
+  KIT_DIR="${OUT_DIR}/${KIT_NAME}"
+  rm -rf "${KIT_DIR}" "${OUT_DIR}/${KIT_NAME}.zip"
+  MOBILECONFIG_OUT_DIR="${KIT_DIR}/macOS"
+  REG_OUT_DIR="${KIT_DIR}/Windows"
+fi
+
 mkdir -p "${OUT_DIR}"
 
 # -----------------------------------------------------------------------------
@@ -734,7 +748,8 @@ else
 fi
 
 generate_mobileconfig() {
-  local out_file="${OUT_DIR}/${INITIALS}_claude_impersonation.mobileconfig"
+  local out_file="${MOBILECONFIG_OUT_DIR}/${INITIALS}_claude_impersonation.mobileconfig"
+  mkdir -p "${MOBILECONFIG_OUT_DIR}"
 
   if [[ ! -f "${MOBILECONFIG_TEMPLATE}" ]]; then
     echo "Error: template not found at ${MOBILECONFIG_TEMPLATE}" >&2
@@ -766,7 +781,8 @@ generate_mobileconfig() {
 }
 
 generate_reg() {
-  local out_file="${OUT_DIR}/${INITIALS}_claude_impersonation.reg"
+  local out_file="${REG_OUT_DIR}/${INITIALS}_claude_impersonation.reg"
+  mkdir -p "${REG_OUT_DIR}"
 
   if [[ ! -f "${REG_TEMPLATE}" ]]; then
     echo "Error: template not found at ${REG_TEMPLATE}" >&2
@@ -843,6 +859,30 @@ case "${PLATFORM_CHOICE}" in
     ;;
 esac
 
+# Copies the helper, installer and instructions next to each generated config
+# and zips the kit.
+package_kit() {
+  cp "${KIT_TEMPLATE_DIR}/README.txt" "${KIT_DIR}/"
+  if [[ -d "${KIT_DIR}/macOS" ]]; then
+    install -m 755 "${ROOT_DIR}/helpers/macos/airia-claude-cred-helper" "${KIT_DIR}/macOS/"
+    install -m 755 "${KIT_TEMPLATE_DIR}/macOS/install.sh" "${KIT_DIR}/macOS/"
+  fi
+  if [[ -d "${KIT_DIR}/Windows" ]]; then
+    cp "${ROOT_DIR}/helpers/windows/airia-claude-cred-helper.ps1" "${KIT_DIR}/Windows/"
+    cp "${KIT_TEMPLATE_DIR}/Windows/install.bat" "${KIT_DIR}/Windows/"
+  fi
+  if command -v zip &>/dev/null; then
+    (cd "${OUT_DIR}" && zip -qrX "${KIT_NAME}.zip" "${KIT_NAME}" -x '*.DS_Store')
+    echo "Created: ${OUT_DIR}/${KIT_NAME}.zip"
+  else
+    echo "zip not found; send the folder ${KIT_DIR} instead." >&2
+  fi
+}
+
+if [[ "${TOKEN_MODE}" == "helper" ]]; then
+  package_kit
+fi
+
 echo ""
 echo "============================================================"
 echo " Done."
@@ -850,6 +890,9 @@ if [[ "${TOKEN_MODE}" == "helper" ]]; then
   echo " These file(s) contain a live credential (the Airia gateway key)."
   echo " The user's Anthropic token is not in them; it is created on their"
   echo " device at first launch. Still treat the files like passwords."
+  echo ""
+  echo " Give the user ${KIT_NAME}.zip. README.txt inside walks them"
+  echo " through installing it."
 else
   echo " These file(s) contain live credentials (Airia gateway key and"
   echo " the user's Anthropic long-lived token) — treat them like"

@@ -78,6 +78,7 @@ $REG_TEMPLATE = Join-Path $ROOT_DIR "templates/Claude_user_impersonation.reg"
 $MOBILECONFIG_TEMPLATE = Join-Path $ROOT_DIR "templates/Claude_user_impersonation.mobileconfig"
 $REG_HELPER_FRAGMENT = Join-Path $ROOT_DIR "templates/helper_script.reg.fragment"
 $MOBILECONFIG_HELPER_FRAGMENT = Join-Path $ROOT_DIR "templates/helper_script.mobileconfig.fragment"
+$KIT_TEMPLATE_DIR = Join-Path $ROOT_DIR "templates/kit"
 
 # -----------------------------------------------------------------------------
 # Fixed admin credentials used only to mint the Airia gateway key that goes
@@ -416,8 +417,8 @@ if (-not $TOKEN_MODE) {
 
 $CLAUDE_LONGLIVED_TOKEN = ""
 if ($TOKEN_MODE -eq "helper") {
-    Write-Host "Using the credential helper. Before the user first opens Claude Desktop,"
-    Write-Host "install it on their machine (MDM or by hand):"
+    Write-Host "Using the credential helper. The output is a zip kit for the user with"
+    Write-Host "the helper, an installer and instructions. To push it by MDM instead:"
     Write-Host "    macOS:   helpers/macos/airia-claude-cred-helper -> /usr/local/bin/ (mode 755)"
     Write-Host "    Windows: helpers\windows\airia-claude-cred-helper.ps1 -> C:\Program Files\Airia\"
     Write-Host "If the Airia browser extension warns or blocks claude.ai, allow"
@@ -615,6 +616,20 @@ Write-Host "  2) macOS (.mobileconfig)"
 Write-Host "  3) Both"
 $PLATFORM_CHOICE = Read-Host "Choose [1/2/3]"
 
+# Helper mode packages everything the user needs (profile, helper, installer,
+# instructions) into generated\<INITIALS>_claude_impersonation\ plus a .zip of
+# it, so the admin hands over one file. Static mode writes the bare config(s).
+$MOBILECONFIG_OUT_DIR = $OUT_DIR
+$REG_OUT_DIR = $OUT_DIR
+if ($TOKEN_MODE -eq "helper") {
+    $KIT_NAME = "${INITIALS}_claude_impersonation"
+    $KIT_DIR = Join-Path $OUT_DIR $KIT_NAME
+    $KIT_ZIP = Join-Path $OUT_DIR "$KIT_NAME.zip"
+    Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $KIT_DIR, $KIT_ZIP
+    $MOBILECONFIG_OUT_DIR = Join-Path $KIT_DIR "macOS"
+    $REG_OUT_DIR = Join-Path $KIT_DIR "Windows"
+}
+
 if (-not (Test-Path $OUT_DIR)) {
     New-Item -ItemType Directory -Path $OUT_DIR | Out-Null
 }
@@ -629,7 +644,8 @@ if ($MCP_ENABLED) {
 }
 
 function Generate-MobileConfig {
-    $out_file = Join-Path $OUT_DIR "${INITIALS}_claude_impersonation.mobileconfig"
+    $out_file = Join-Path $MOBILECONFIG_OUT_DIR "${INITIALS}_claude_impersonation.mobileconfig"
+    New-Item -ItemType Directory -Force -Path $MOBILECONFIG_OUT_DIR | Out-Null
     if (-not (Test-Path $MOBILECONFIG_TEMPLATE)) {
         Write-Warning "Error: template not found at $MOBILECONFIG_TEMPLATE"
         return
@@ -660,7 +676,8 @@ function Generate-MobileConfig {
 }
 
 function Generate-Reg {
-    $out_file = Join-Path $OUT_DIR "${INITIALS}_claude_impersonation.reg"
+    $out_file = Join-Path $REG_OUT_DIR "${INITIALS}_claude_impersonation.reg"
+    New-Item -ItemType Directory -Force -Path $REG_OUT_DIR | Out-Null
     if (-not (Test-Path $REG_TEMPLATE)) {
         Write-Warning "Error: template not found at $REG_TEMPLATE"
         return
@@ -714,6 +731,29 @@ switch ($PLATFORM_CHOICE) {
     }
 }
 
+# Copies the helper, installer and instructions next to each generated config
+# and zips the kit. The zip drops the macOS executable bit; install.sh is run
+# with `bash` and sets the helper's mode itself, so that doesn't matter.
+function Package-Kit {
+    Copy-Item (Join-Path $KIT_TEMPLATE_DIR "README.txt") $KIT_DIR
+    $macDir = Join-Path $KIT_DIR "macOS"
+    if (Test-Path $macDir) {
+        Copy-Item (Join-Path $ROOT_DIR "helpers/macos/airia-claude-cred-helper") $macDir
+        Copy-Item (Join-Path $KIT_TEMPLATE_DIR "macOS/install.sh") $macDir
+    }
+    $winDir = Join-Path $KIT_DIR "Windows"
+    if (Test-Path $winDir) {
+        Copy-Item (Join-Path $ROOT_DIR "helpers/windows/airia-claude-cred-helper.ps1") $winDir
+        Copy-Item (Join-Path $KIT_TEMPLATE_DIR "Windows/install.bat") $winDir
+    }
+    Compress-Archive -Path $KIT_DIR -DestinationPath $KIT_ZIP -Force
+    Write-Host "Created: $KIT_ZIP"
+}
+
+if ($TOKEN_MODE -eq "helper") {
+    Package-Kit
+}
+
 Write-Host ""
 Write-Host "============================================================"
 Write-Host " Done."
@@ -721,6 +761,9 @@ if ($TOKEN_MODE -eq "helper") {
     Write-Host " These file(s) contain a live credential (the Airia gateway key)."
     Write-Host " The user's Anthropic token is not in them; it is created on their"
     Write-Host " device at first launch. Still treat the files like passwords."
+    Write-Host ""
+    Write-Host " Give the user $KIT_NAME.zip. README.txt inside walks them"
+    Write-Host " through installing it."
 } else {
     Write-Host " These file(s) contain live credentials (Airia gateway key and"
     Write-Host " the user's Anthropic long-lived token) - treat them like"

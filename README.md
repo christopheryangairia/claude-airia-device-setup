@@ -460,7 +460,22 @@ Things to know:
 - **Re-mint by hand:** `airia-claude-cred-helper --reset` (macOS) or run the
   `.ps1` with `-Reset` (Windows), then relaunch Claude Desktop.
 
-Output files land in `./generated/` as `<INITIALS>_claude_impersonation.reg`
+In helper mode the output is a ready-to-hand-over kit:
+
+```
+generated/<INITIALS>_claude_impersonation.zip
+└── <INITIALS>_claude_impersonation/
+    ├── README.txt                 ← end-user instructions
+    ├── macOS/   install.sh, airia-claude-cred-helper, <INITIALS>_claude_impersonation.mobileconfig
+    └── Windows/ install.bat, airia-claude-cred-helper.ps1, <INITIALS>_claude_impersonation.reg
+```
+
+Only the platform folder(s) you chose are included. The installers copy the
+helper into place and load the profile/registry policy; the user then
+relaunches Claude Desktop and signs in once. The kit sources live in
+`templates/kit/`.
+
+In static mode, output files land in `./generated/` as `<INITIALS>_claude_impersonation.reg`
 / `<INITIALS>_claude_impersonation.mobileconfig` — same live-credential
 handling rules apply (never commit, treat like passwords, deliver only to
 the intended user).

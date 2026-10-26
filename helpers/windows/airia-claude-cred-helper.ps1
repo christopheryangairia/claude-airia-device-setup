@@ -195,6 +195,42 @@ public static class AiriaConPty {
 }
 '@
 
+# What BROWSER points at. Setting BROWSER to explorer.exe opened nothing on some
+# PCs even though explorer.exe opens the same URL fine from a prompt, so hand the
+# CLI a tiny exe instead. It takes the URL however it is passed, logs the raw
+# command line, and opens it with ShellExecute (the default browser).
+$openUrl = @'
+using System;
+using System.IO;
+using System.Diagnostics;
+using System.Text.RegularExpressions;
+
+public static class AiriaOpenUrl {
+    public static int Main(string[] args) {
+        string raw = Environment.CommandLine;
+        string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Airia");
+        try { File.AppendAllText(Path.Combine(dir, "browser-launch.log"), DateTime.Now.ToString("s") + " " + raw + Environment.NewLine); } catch { }
+        Match m = Regex.Match(raw, "https?://[^\\s\"']+");
+        if (!m.Success) return 1;
+        Process.Start(new ProcessStartInfo(m.Value) { UseShellExecute = true });
+        return 0;
+    }
+}
+'@
+
+function Get-BrowserLauncher {
+    $exe = Join-Path $StoreDir 'airia-open-url.exe'
+    if (Test-Path $exe) { return $exe }
+    New-Item -ItemType Directory -Force -Path $StoreDir | Out-Null
+    try {
+        Add-Type -TypeDefinition $openUrl -Language CSharp -OutputAssembly $exe -OutputType WindowsApplication
+        return $exe
+    } catch {
+        Log "could not build the browser launcher ($($_.Exception.Message)); falling back to explorer.exe"
+        return (Join-Path $env:WINDIR 'explorer.exe')
+    }
+}
+
 function Get-NewToken {
     $claude = Find-Claude
     if (-not $claude) {
@@ -207,8 +243,8 @@ function Get-NewToken {
     Log 'no gateway token for this user; opening the browser for a one-time Claude sign-in'
     # The CLI's own browser launch fails silently when Desktop runs this helper, but
     # it honors BROWSER, and the URL it hands over has the localhost callback that
-    # finishes sign-in without a code to paste. explorer.exe opens it in the default browser.
-    $env:BROWSER = Join-Path $env:WINDIR 'explorer.exe'
+    # finishes sign-in without a code to paste. Get-BrowserLauncher opens it in the default browser.
+    $env:BROWSER = Get-BrowserLauncher
     [AiriaConPty]::Start("`"$claude`" setup-token")
     # The CLI opens the browser itself, with a localhost callback that completes the
     # sign-in on its own. Don't open the printed URL instead: that one ends on a page

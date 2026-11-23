@@ -14,7 +14,7 @@ Run whichever matches the machine you're on, from the project root:
 - `.\setup_claude.ps1` — PowerShell (Windows). `run.bat` is a
   double-clickable launcher for this script.
 
-Either one asks a single question — **Gateway** (Airia-minted universal key;
+Either one asks a single question — **Gateway** (Airia-issued per-user key;
 Claude Desktop auto-discovers models) or **OAuth Passthrough / User
 Impersonation** (bills the *user's own* Anthropic plan subscription instead
 of an Airia-side key) — then hands off to the matching script under
@@ -57,6 +57,15 @@ behavior documented below.
 
 ## 1. Before you run anything — set the admin config values
 
+> **Change (Nov 2026): the scripts no longer mint user gateway keys.** Airia
+> now rejects `POST /v1/GatewayApiKey` from *any* API key (admin or developer)
+> with `403 api_key_caller_not_allowed` — "This operation can't be performed
+> with an API key. Sign in to the Airia console to do it." Revealing an
+> existing key via `GET /v1/GatewayApiKey/{keyId}` is blocked too. So an
+> **admin must run the script**, create the user's gateway key in the Airia
+> console when prompted, and paste it in. See [Section 2](#2-what-the-script-asks-you-step-by-step), step 6.
+> `KEY_TYPE` / `ENABLED` are no longer used.
+
 Both scripts need two admin-level values filled in **once per Airia
 environment/organization** before handing the script to anyone. These are not
 per-user values — the script will still ask each individual user for their
@@ -72,13 +81,8 @@ cp .env_sample .env
 
 ```dotenv
 # .env
-MINT_API_KEY="ak-..."
 GATEWAY_CONFIGURATION_ID="2d25bdf7-..."
-
-# Optional overrides — see the table below. Uncomment only if you need
-# something other than the defaults.
-# KEY_TYPE="User"
-# ENABLED="true"
+MINT_API_KEY="ak-..."   # optional — lookups + default OTLP key (no longer mints)
 ```
 
 All four scripts under `scripts/` (`setup_claude_gateway.sh`/`.ps1` and
@@ -99,16 +103,12 @@ directly in the small constants block near the top of each script under
 # scripts/setup_claude_gateway.sh
 MINT_API_KEY=""
 GATEWAY_CONFIGURATION_ID=""
-KEY_TYPE="User"
-ENABLED="true"
 ```
 
 ```powershell
 # scripts/setup_claude_gateway.ps1
 $MINT_API_KEY = if ($env:MINT_API_KEY) { $env:MINT_API_KEY } else { "" }
 $GATEWAY_CONFIGURATION_ID = if ($env:GATEWAY_CONFIGURATION_ID) { $env:GATEWAY_CONFIGURATION_ID } else { "" }
-$KEY_TYPE = "User"
-$ENABLED = $true
 ```
 
 A value set directly in the script's constants block only takes effect if
@@ -118,10 +118,8 @@ if both are present.
 
 | Env var | What it is | Where to get it |
 |---|---|---|
-| `MINT_API_KEY` | **Required.** An **admin-level** Airia API key with permission to create new Gateway API keys via the `/v1/GatewayApiKey` endpoint. This is the credential the script authenticates itself with — it is not the key that ends up in the generated config file. By default it is also reused as the OTLP telemetry key (see `<OTLP-API-KEY>` below), unless the person running the script chooses to supply a different one. | Airia Platform → Gateway settings → API Keys (admin/org-owner access), or ask your Airia Admin. |
-| `GATEWAY_CONFIGURATION_ID` | **Required.** The ID of the specific Gateway Configuration in Airia that the newly minted user key should belong to. Every key minted by this script is scoped to this configuration. | Airia Platform → Gateway → the specific Gateway Configuration's details page. Ask your Admin if you don't see it. |
-| `KEY_TYPE` | Optional (defaults to `"User"`). The type of key to request from Airia when minting. `"User"` mints a personal, per-person key (this is what the script is designed around — each run mints one key for one email). Other values may be supported by your Airia environment (e.g. a service/team-level key type) but changing this changes what kind of key gets generated. | Leave unset/`"User"` unless your Admin tells you otherwise. |
-| `ENABLED` | Optional (defaults to `"true"`). Whether the newly minted key should be **active immediately** on the gateway (`true`) or created in a disabled state (`false`) so an admin has to flip it on later. This does not affect anything already in the generated config file — it only affects whether the key actually works on Airia's side the moment it's created. | Leave unset/`"true"` for normal onboarding. Set to `false` if your process requires an admin to explicitly approve/enable new keys before they're usable. |
+| `GATEWAY_CONFIGURATION_ID` | **Required.** The ID of the Gateway Configuration in Airia that the user's key belongs to. The script uses it to build the console deep link where the admin grants access and creates the key, and for the read-only lookups. | Airia Platform → Gateway → the specific Gateway Configuration's details page. Ask your Admin if you don't see it. |
+| `MINT_API_KEY` | **Optional** (name kept for backward compatibility). An Airia API key (admin or developer) used **only** for read-only lookups — `GET /v1/Users`, `GET /v1/GatewayConfiguration/{id}` (existing-key warning) and `GET .../users-access` (access check) — and, by default, as the OTLP telemetry key. It **cannot mint user keys any more**. If unset, the lookups are skipped (you confirm access manually) and you must enter an OTLP key directly. | Airia Platform → API Keys, or ask your Airia Admin. |
 
 If your organization only has one Airia gateway configuration, you'll set
 these once and never touch them again. If you support multiple environments
@@ -149,51 +147,39 @@ fully automatic, some only prompt you conditionally:
    actual value in **Airia Platform → Gateway**. If you don't have access,
    ask your Admin. This becomes `<AIRIA-AI-GATEWAY>` in the generated config.
 3. **User's email address** — The person this config file is being generated
-   for. Used to mint/reuse their personal gateway key, verify their gateway
-   access, and tag their OTLP telemetry.
+   for. Used to look up the user, verify their gateway access, and tag their
+   OTLP telemetry.
 4. *(automatic)* — Looks up that email in the tenant's Users directory
-   (`GET /v1/Users`) to resolve the person's platform user id. This id is
-   what the next two checks are keyed on. If the email isn't found here
-   (e.g. the person hasn't been provisioned in Airia yet), both of the
-   following checks are skipped and you're asked to confirm access manually
-   instead.
-5. *(automatic, conditional prompt)* — **Checks for an existing gateway API
-   key.** Calls `GET /v1/GatewayConfiguration/{id}` and looks for an
-   already-enabled key belonging to that user id. If one (or more) exists,
-   you're asked:
-
-   > `User API key detected: found N existing enabled gateway API key(s)...`
-   > `Use an existing key instead of creating another? [y/N]`
-
-   - Answering **y** tries to fetch the real value via
-     `GET /v1/GatewayApiKey/{keyId}`. This endpoint has proven unreliable in
-     practice (it can 404 on a key that's otherwise valid and enabled) — if
-     it fails, or returns a masked-looking value (containing `•`), you're
-     asked to paste the real key manually instead; leaving that blank falls
-     through to minting a brand-new key.
-   - Answering **N** (or no existing key was found) proceeds to step 6 and
-     mints a new key as before.
-6. *(automatic, skipped if step 5 reused a key)* — Calls Airia's
-   `/v1/GatewayApiKey` endpoint using `MINT_API_KEY`, `GATEWAY_CONFIGURATION_ID`,
-   `KEY_TYPE`, `ENABLED`, and the email from step 3, and receives back a
-   fresh personal API key for that user.
-7. *(automatic, conditional prompt)* — **Verifies gateway access.** Calls
+   (`GET /v1/Users`) to resolve the person's platform user id. If the email
+   isn't found (or `MINT_API_KEY` isn't set), the automatic checks below are
+   skipped and you're asked to confirm access manually instead.
+5. *(automatic, conditional prompt)* — **Verifies gateway access.** Calls
    `GET /v1/GatewayConfiguration/{id}/users-access` and checks whether the
-   user id from step 4 is already on that list. If they're missing, you're
-   shown a direct link into **Secure > Gateway > [config] > edit** and
-   asked `Have you done it? [y/N]` — answering **y** re-checks the list
-   (looping back if it's still missing); answering **N** just prints a
-   warning and continues rather than blocking you.
-8. **OTLP API key** — The OTLP endpoint itself is derived automatically from
+   user id from step 4 is on that list. If they're missing, you're shown a
+   direct link into **Secure > Gateway > [config] > edit** and asked
+   `Have you done it? [y/N]` — **y** re-checks (looping if still missing);
+   **N** prints a warning and continues.
+6. **User's gateway API key (admin, in the console).** The script can no
+   longer create this key itself (see the note in Section 1). It:
+   - warns you if the user already has enabled keys on this configuration
+     (`GET /v1/GatewayConfiguration/{id}`, masked values only) — paste one of
+     those if you still have its value;
+   - prints the same **Secure > Gateway > [config]** link and asks you, signed
+     in as an admin, to create a **User** API key for the email from step 3;
+   - prompts `Paste the user's gateway API key (input hidden)`. It loops until
+     a value is entered, rejects masked values (containing `•`), and echoes
+     only a short preview (`ak-abc…wxyz`) to confirm.
+7. **OTLP API key** — The OTLP endpoint itself is derived automatically from
    the `BASE_URL` you entered in step 1 (`<BASE_URL>/v1/ClaudeCodeOtelIngest/ingest`).
    You're then asked whether you want to provide a **separate** API key for
    OTLP telemetry ingestion. If you say no (the default), the script reuses
-   `MINT_API_KEY` for this purpose. If you say yes, you'll be prompted to
+   `MINT_API_KEY` for this purpose (if `MINT_API_KEY` isn't set, you're
+   asked for an OTLP key directly). If you say yes, you'll be prompted to
    paste a distinct key.
-9. **Optional MCP server** — If you want Claude Desktop to auto-connect to a
+8. **Optional MCP server** — If you want Claude Desktop to auto-connect to a
    managed MCP server for this user, say yes and provide a name and URL. If
    you decline, the config is generated with no MCP servers registered.
-10. **Data import / export** — Asks whether users may import their existing
+9. **Data import / export** — Asks whether users may import their existing
     Claude.ai history (and third-party history, e.g. ChatGPT) into this
     managed install, and export their data back out. Defaults to **no**.
     Either answer writes an explicit policy, so a decline is a deliberate
@@ -204,10 +190,10 @@ At the end, you choose whether to generate the Windows `.reg`, the macOS
 `<INITIALS>_claude.reg` / `<INITIALS>_claude.mobileconfig`, where initials
 are derived from the user's email (and can be overridden).
 
-> Steps 4, 5, and 7 all rely on the same tenant lookups and degrade
-> gracefully — if `jq` and `python3` are both unavailable, or the lookups
-> fail outright, the script simply skips straight to minting a new key and
-> asking you to confirm access manually, rather than blocking.
+> Steps 4–6 rely on read-only tenant lookups and degrade gracefully — if
+> `jq` and `python3` are both unavailable, `MINT_API_KEY` is unset, or the
+> lookups fail, the script just asks you to confirm access manually and
+> still prompts for the key, rather than blocking.
 
 ---
 
@@ -220,12 +206,12 @@ these before writing the final file to `./generated/`.
 | Placeholder | Filled with | Purpose |
 |---|---|---|
 | `<AIRIA-AI-GATEWAY>` | The AI Gateway URL entered in step 2 | Base URL Claude Desktop sends inference (chat/completion) requests to, via Airia's gateway instead of directly to Anthropic. The template appends `/anthropic` to this value (`inferenceGatewayBaseUrl`). |
-| `<USER-API-KEY>` | The personal key from step 5/6 above — either reused from an existing key (step 5) or freshly minted (step 6) | The credential Claude Desktop uses to authenticate this specific user's requests against the gateway (`inferenceGatewayApiKey`). This is the sensitive, per-user secret — treat generated files like passwords. |
+| `<USER-API-KEY>` | The personal key the admin created in the console and pasted at step 6 | The credential Claude Desktop uses to authenticate this specific user's requests against the gateway (`inferenceGatewayApiKey`). This is the sensitive, per-user secret — treat generated files like passwords. |
 | `<OTLP-ENDPOINT>` | The `BASE_URL` entered in step 1 | Base URL for OpenTelemetry (OTLP) ingestion. The template appends the fixed path `/v1/ClaudeCodeOtelIngest/ingest` to form the full `otlpEndpoint`. This is how usage/telemetry data flows back into Airia. |
-| `<OTLP-API-KEY>` | Either `MINT_API_KEY` (default) or a separate key you provide in step 8 | Value sent as the `X-API-KEY` header (`otlpHeaders`) when Claude Desktop pushes telemetry to the OTLP endpoint above. |
-| `<USER-EMAIL>` | The email entered in step 3 | Used to tag telemetry with the user's identity (`otlpResourceAttributes` → `airia.user-email`), and is the identity the personal API key was minted for. |
-| `<MCP-SERVER-NAME>` / `<MCP-URL>` | The values entered in step 9, if you opted in | Name and URL of a managed MCP server for Claude Desktop to auto-register (`managedMcpServers`). If you decline MCP setup, this whole field is written as an empty array (`[]`) instead of leaving these placeholders unfilled. |
-| `<CLAUDE-AI-IMPORT>` | A JSON policy blob derived from your yes/no answer in step 10 | Controls data import/export (`claudeAiImport`). Four sub-fields: `enabled` (may the user import their Claude.ai history at all), `automatic3pImport` (auto-offer import from third-party AI tools such as ChatGPT), `exportEnabled` (may the user export their data back out), and `bannerBehavior` (`show`/`hide` the in-app import banner). Answering **y** writes all three booleans `true` with `bannerBehavior: show`; answering **N** writes all three `false` with `bannerBehavior: hide`. |
+| `<OTLP-API-KEY>` | Either `MINT_API_KEY` (default) or a separate key you provide in step 7 | Value sent as the `X-API-KEY` header (`otlpHeaders`) when Claude Desktop pushes telemetry to the OTLP endpoint above. |
+| `<USER-EMAIL>` | The email entered in step 3 | Used to tag telemetry with the user's identity (`otlpResourceAttributes` → `airia.user-email`), and is the identity the personal API key was created for. |
+| `<MCP-SERVER-NAME>` / `<MCP-URL>` | The values entered in step 8, if you opted in | Name and URL of a managed MCP server for Claude Desktop to auto-register (`managedMcpServers`). If you decline MCP setup, this whole field is written as an empty array (`[]`) instead of leaving these placeholders unfilled. |
+| `<CLAUDE-AI-IMPORT>` | A JSON policy blob derived from your yes/no answer in step 9 | Controls data import/export (`claudeAiImport`). Four sub-fields: `enabled` (may the user import their Claude.ai history at all), `automatic3pImport` (auto-offer import from third-party AI tools such as ChatGPT), `exportEnabled` (may the user export their data back out), and `bannerBehavior` (`show`/`hide` the in-app import banner). Answering **y** writes all three booleans `true` with `bannerBehavior: show`; answering **N** writes all three `false` with `bannerBehavior: hide`. |
 
 A few settings in the templates are **not** placeholders — they're fixed
 values baked into the templates themselves and aren't touched by the script:
@@ -268,7 +254,7 @@ for the duplicate-key and access checks (steps 4/5/7 above). If `jq` isn't
 installed, the script falls back to `python3` for those same lookups; if
 neither is available, it falls back further to `grep`/`cut` for the basic
 API key extraction and simply skips the automatic user/key matching (you'll
-always be prompted to confirm access and mint a fresh key manually).
+always be prompted to confirm access manually).
 
 **`scripts/setup_claude_gateway.ps1`**: Windows PowerShell with internet
 access to reach the `BASE_URL` you provide (uses `Invoke-RestMethod`, which
@@ -278,12 +264,11 @@ is built in — no extra dependency needed for the equivalent checks).
 
 ## 6. Troubleshooting
 
-- **"gateway API key request failed (HTTP ...)"** — Check that
-  `MINT_API_KEY` and `GATEWAY_CONFIGURATION_ID` are correct for the
-  environment behind the `BASE_URL` you entered, and that `MINT_API_KEY`
-  hasn't expired or been revoked. If you're setting these via `.env`, double
-  check there's no stray whitespace or mismatched quote at the end of a line.
-- **"Warning: MINT_API_KEY and/or GATEWAY_CONFIGURATION_ID are not set"**,
+- **`403 api_key_caller_not_allowed` from `/v1/GatewayApiKey`** — expected
+  on older copies of these scripts: Airia no longer lets API keys mint (or
+  reveal) gateway keys. Update to the current scripts, which ask the admin to
+  create the key in the console and paste it.
+- **"Warning: GATEWAY_CONFIGURATION_ID is not set"**,
   or the script otherwise seems to ignore your `.env` — confirm the file is
   literally named `.env` and sits in the **project root** (next to
   `setup_claude.sh`/`.ps1`, *not* inside `scripts/`), and that you don't
@@ -298,19 +283,13 @@ is built in — no extra dependency needed for the equivalent checks).
 - **Region wasn't detected correctly** — This only matters for the
   *suggested* Gateway URL; you can always type the real one at that prompt
   regardless of what region was detected.
-- **"The retrieved key value is masked/obfuscated"** — you chose to reuse an
-  existing key, but Airia returned a partial/obfuscated value instead of the
-  real one. Paste the real key manually if you have it (e.g. from wherever
-  it was originally delivered), or leave it blank to mint a new key instead.
-- **Reusing an existing key silently falls back to minting a new one** — this
-  is expected if `GET /v1/GatewayApiKey/{keyId}` 404s for that key. This
-  endpoint has proven unreliable even for keys that show as valid/enabled in
-  `GET /v1/GatewayConfiguration/{id}`; the script treats that as "couldn't
-  retrieve it" rather than an error, and mints a fresh key instead.
+- **"That looks like a masked value (contains •)"** — you pasted the masked
+  preview from the console list. Copy the full value shown when the key is
+  created; if you no longer have it, create a new key.
 - **"Could not find '\<email\>' in the tenant user directory"** — the email
   doesn't have a match in `GET /v1/Users` for this tenant, so the script
-  can't resolve a platform user id and skips the duplicate-key and
-  access-list checks. This usually means the person hasn't been invited to
+  can't resolve a platform user id and skips the existing-key warning and
+  access-list check. This usually means the person hasn't been invited to
   the tenant yet — invite them first if you expect these checks to run.
 - **"Still not finding '\<email\>' in the access list" / stuck in the
   access-confirmation loop** — the script re-checks
@@ -323,7 +302,7 @@ is built in — no extra dependency needed for the equivalent checks).
 
 ## 7. User Impersonation variant
 
-Everything above describes the **default** setup, where an Airia-minted
+Everything above describes the **default** setup, where an Airia-issued
 gateway key (`inferenceGatewayApiKey`) authenticates every request and Claude
 Desktop auto-discovers available models.
 
@@ -340,7 +319,7 @@ setup — they go in **different** places:
 | Credential | Format | Goes in | Sent as |
 |---|---|---|---|
 | The user's own Anthropic OAuth token | `sk-ant-oat01-...` | `inferenceGatewayApiKey` | `Authorization: Bearer` |
-| Airia-issued gateway key (same kind minted by the default flow) | Airia-issued (`agk-...`) | `inferenceCustomHeaders` → `x-airia-key` | custom header |
+| Airia-issued gateway key (same kind as the default flow) | Airia-issued (`agk-...`) | `inferenceCustomHeaders` → `x-airia-key` | custom header |
 
 Mixing these up is the #1 failure mode (401 "Invalid API key") — see the
 Troubleshooting table in the PDF.
@@ -359,9 +338,8 @@ Troubleshooting table in the PDF.
 
 ### What's different from the default script
 
-1. **Airia gateway key still gets minted the same way** (`POST
-   /v1/GatewayApiKey` using `MINT_API_KEY` + `GATEWAY_CONFIGURATION_ID` from
-   `.env` — same admin values as the default script), but the result is
+1. **Airia gateway key is obtained the same way** (an admin creates it in
+   the console and pastes it — same as the default script), but it is
    written into the `x-airia-key` custom header instead of
    `inferenceGatewayApiKey`.
 2. **New prompt: how the user's Claude long-lived token is provided.**
@@ -395,18 +373,18 @@ Troubleshooting table in the PDF.
 5. Everything else — BASE_URL/region detection, AI Gateway URL, user email,
    OTLP endpoint/key, optional MCP server, data import/export, output platform choice — works
    identically to `scripts/setup_claude_gateway.sh`/`.ps1`. That includes the same
-   pre-mint checks described in [Section 2](#2-what-the-script-asks-you-step-by-step):
-   resolving the email to a platform user id, checking for and optionally
-   reusing an existing enabled gateway key (the one that ends up in
-   `x-airia-key`, not the Anthropic token), and verifying/confirming gateway
-   access afterward.
+   checks described in [Section 2](#2-what-the-script-asks-you-step-by-step):
+   resolving the email to a platform user id, verifying/confirming gateway
+   access, warning about existing enabled gateway keys, and the admin
+   paste prompt for the key that ends up in `x-airia-key` (not the
+   Anthropic token).
 
 ### Placeholder reference (impersonation templates)
 
 | Placeholder | Filled with | Purpose |
 |---|---|---|
 | `<AIRIA-AI-GATEWAY>` | The AI Gateway URL | Same as the default template — `inferenceGatewayBaseUrl` with `/anthropic` appended. |
-| `<AIRIA-GATEWAY-KEY>` | The gateway key from the key acquisition step — reused from an existing key or freshly minted via `/v1/GatewayApiKey` (same logic as the default flow's step 5/6) | Written into `inferenceCustomHeaders` as `{"x-airia-key":"..."}`. Authenticates to Airia / identifies the tenant config. |
+| `<AIRIA-GATEWAY-KEY>` | The gateway key the admin created in the console and pasted (same prompt as the default flow's step 6) | Written into `inferenceCustomHeaders` as `{"x-airia-key":"..."}`. Authenticates to Airia / identifies the tenant config. |
 | `<CLAUDE-LONGLIVED-TOKEN>` | Static mode: the user's own `sk-ant-oat01-...` token, pasted at the "Claude long-lived token" prompt ("What's different" item 2 above). Helper mode: the `inferenceGatewayApiKey` entry is removed and `inferenceCredentialKind` is replaced with the keys from `templates/helper_script.*.fragment` | Written into `inferenceGatewayApiKey`. Authenticates to Anthropic and bills the user's own plan seat. Sent as `Authorization: Bearer` (see `inferenceGatewayAuthScheme`, fixed to `"bearer"` in the template). |
 | `<OTLP-ENDPOINT>` / `<OTLP-API-KEY>` / `<USER-EMAIL>` | Same as the default flow | Telemetry wiring — unchanged from `scripts/setup_claude_gateway.sh`/`.ps1`. |
 | `<MODELS-JSON>` | The confirmed model list from the manual model list step ("What's different" item 4 above), e.g. `[{"name":"claude-sonnet-4-6","supports1m":false},{"name":"claude-haiku-5-5","supports1m":false}]` | Written into `inferenceModels`. Must match the Allowed Models list on the Airia gateway side. |
@@ -438,7 +416,7 @@ Install, before the user first opens Claude Desktop:
 | Windows | `helpers/windows/airia-claude-cred-helper.ps1` | `C:\Program Files\Airia\airia-claude-cred-helper.ps1` |
 
 Neither helper contains secrets or per-user values. The per-user value that
-remains is the Airia gateway key in `x-airia-key`, which this script mints.
+remains is the Airia gateway key in `x-airia-key`, which the admin pastes into this script.
 
 Things to know:
 

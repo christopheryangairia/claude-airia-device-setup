@@ -10,8 +10,8 @@
 #     2. Ask for the AI Gateway URL (suggesting the standard pattern for the
 #        detected region: https://<region>.gateway.airia.ai/)
 #     3. Ask for the user's email address
-#     4. Request a personal Gateway API key from Airia (User key type) using
-#        that email
+#     4. Have the admin paste the user's personal Gateway API key, created
+#        in the Airia console (API keys can no longer mint gateway keys)
 #     5. Derive the OTLP endpoint from the same BASE_URL, and ask for the
 #        OTLP API key (X-API-Key header used for telemetry ingestion)
 #     6. Optionally ask for an MCP server name + URL to manage
@@ -34,14 +34,15 @@ REG_TEMPLATE="${ROOT_DIR}/templates/Claude.reg"
 MOBILECONFIG_TEMPLATE="${ROOT_DIR}/templates/Claude.mobileconfig"
 
 # -----------------------------------------------------------------------------
-# Fixed admin credentials used only to mint a personal user API key.
-# These are tied to a specific Airia gateway configuration — update them if
-# your organization uses a different admin key / configuration id.
+# Admin config for this Airia gateway configuration. GATEWAY_CONFIGURATION_ID
+# is required. MINT_API_KEY (an admin or developer API key) is optional: it's
+# used only for read-only lookups (user directory, existing keys, access list)
+# and as the default OTLP key. It no longer mints user keys — Airia rejects
+# POST /v1/GatewayApiKey from any API key, so an admin creates the user's key
+# in the console and pastes it in when prompted.
 # -----------------------------------------------------------------------------
 MINT_API_KEY=""
 GATEWAY_CONFIGURATION_ID=""
-KEY_TYPE="User"
-ENABLED="true"
 
 # Load .env file if present using a safe parser. Accepts lines like:
 #   MINT_API_KEY=ak-...
@@ -81,17 +82,21 @@ fi
 MINT_API_KEY="${MINT_API_KEY:-}"
 GATEWAY_CONFIGURATION_ID="${GATEWAY_CONFIGURATION_ID:-}"
 
-if [[ -z "${MINT_API_KEY}" || -z "${GATEWAY_CONFIGURATION_ID}" ]]; then
-  echo "Warning: MINT_API_KEY and/or GATEWAY_CONFIGURATION_ID are not set." >&2
+if [[ -z "${GATEWAY_CONFIGURATION_ID}" ]]; then
+  echo "Warning: GATEWAY_CONFIGURATION_ID is not set." >&2
   echo "Create a .env file in the project root with:" >&2
-  echo "  MINT_API_KEY=ak-..." >&2
   echo "  GATEWAY_CONFIGURATION_ID=..." >&2
+  echo "  MINT_API_KEY=ak-...   # optional: user/access lookups + default OTLP key" >&2
+fi
+if [[ -z "${MINT_API_KEY}" ]]; then
+  echo "Note: MINT_API_KEY is not set — the user lookup and gateway-access check" >&2
+  echo "will be skipped, and you'll be asked for an OTLP key directly." >&2
 fi
 
 echo "============================================================"
 echo " Claude Desktop — Airia Gateway Setup"
 echo "============================================================"
-echo "This will request a personal Airia gateway API key for a user"
+echo "This will take a personal Airia gateway API key for a user (created by an admin in the console)"
 echo "and generate a ready-to-install Claude Desktop config file"
 echo "(Windows .reg and/or macOS .mobileconfig) with that key baked in."
 echo ""
@@ -252,135 +257,13 @@ GATEWAY_USER_ID="$(resolve_user_id)"
 echo ""
 
 # -----------------------------------------------------------------------------
-# 3c. Check for an existing gateway API key for this user before minting a
-#     new one. GET /v1/GatewayConfiguration/{id} lists apiKeys[] (masked
-#     values only) with a resourceId matching the platform user id above.
-#     GET /v1/GatewayApiKey/{keyId} can return the full value, but has proven
-#     unreliable (404s on some otherwise-valid, enabled keys) — if it fails
-#     we fall back to minting a new key rather than blocking.
-# -----------------------------------------------------------------------------
-USER_API_KEY=""
-if [[ -n "${GATEWAY_USER_ID}" ]]; then
-  echo "Checking for existing gateway API keys for ${USER_EMAIL}..."
-  CONFIG_RESPONSE=$(curl --silent --show-error \
-    --request GET \
-    --url "${BASE_URL}/v1/GatewayConfiguration/${GATEWAY_CONFIGURATION_ID}" \
-    --header "X-API-Key: ${MINT_API_KEY}" 2>/dev/null)
-
-  if command -v jq &>/dev/null; then
-    EXISTING_KEY_IDS=$(echo "${CONFIG_RESPONSE}" | jq -r --arg uid "${GATEWAY_USER_ID}" \
-      '.apiKeys[]? | select(.resourceId == $uid and .enabled == true) | .id' 2>/dev/null) || true
-  elif command -v python3 &>/dev/null; then
-    EXISTING_KEY_IDS=$(python3 -c "
-import json, sys
-try:
-    data = json.loads(sys.argv[1])
-except Exception:
-    sys.exit(0)
-uid = sys.argv[2]
-for k in data.get('apiKeys', []):
-    if k.get('resourceId') == uid and k.get('enabled'):
-        print(k.get('id', ''))
-" "${CONFIG_RESPONSE}" "${GATEWAY_USER_ID}")
-  else
-    EXISTING_KEY_IDS=""
-  fi
-
-  if [[ -n "${EXISTING_KEY_IDS}" ]]; then
-    EXISTING_KEY_COUNT=$(echo "${EXISTING_KEY_IDS}" | wc -l | tr -d ' ')
-    echo "User API key detected: found ${EXISTING_KEY_COUNT} existing enabled gateway API key(s) for '${USER_EMAIL}'."
-    read -rp "Use an existing key instead of creating another? [y/N]: " REUSE_CHOICE
-    if [[ "${REUSE_CHOICE}" =~ ^[Yy] ]]; then
-      REUSE_KEY_ID=$(echo "${EXISTING_KEY_IDS}" | head -n1)
-      FETCHED=$(curl --silent --show-error \
-        --request GET \
-        --url "${BASE_URL}/v1/GatewayApiKey/${REUSE_KEY_ID}" \
-        --header "X-API-Key: ${MINT_API_KEY}" 2>/dev/null)
-      if command -v jq &>/dev/null; then
-        FETCHED_KEY=$(echo "${FETCHED}" | jq -r '.apiKey // empty' 2>/dev/null) || true
-      else
-        FETCHED_KEY=$(echo "${FETCHED}" | grep -o '"apiKey":"[^"]*"' | cut -d'"' -f4)
-      fi
-
-      if [[ -n "${FETCHED_KEY}" && "${FETCHED_KEY}" == *"•"* ]]; then
-        echo "The retrieved key value is masked/obfuscated: ${FETCHED_KEY}"
-        read -rp "Paste the real key manually (or leave blank to create a new one instead): " MANUAL_KEY
-        if [[ -n "${MANUAL_KEY}" ]]; then
-          USER_API_KEY="${MANUAL_KEY}"
-          echo "Using manually entered key."
-        else
-          echo "No key entered — a new key will be created instead."
-        fi
-      elif [[ -n "${FETCHED_KEY}" ]]; then
-        USER_API_KEY="${FETCHED_KEY}"
-        echo "Reusing existing gateway API key."
-      else
-        echo "Warning: could not retrieve the existing key's value via the API — a new key will be created instead." >&2
-      fi
-    fi
-  fi
-fi
-echo ""
-
-# -----------------------------------------------------------------------------
-# 4. Create the gateway API key (skipped if an existing key was reused above)
-# -----------------------------------------------------------------------------
-if [[ -z "${USER_API_KEY}" ]]; then
-  echo "Requesting gateway API key from Airia..."
-
-  ENDPOINT="${BASE_URL}/v1/GatewayApiKey"
-
-  BODY=$(cat <<EOF
-{
-  "gatewayConfigurationId": "${GATEWAY_CONFIGURATION_ID}",
-  "type": "${KEY_TYPE}",
-  "enabled": ${ENABLED},
-  "email": "${USER_EMAIL}"
-}
-EOF
-  )
-
-  HTTP_RESPONSE=$(curl --silent --show-error \
-    --request POST \
-    --url "${ENDPOINT}" \
-    --header "Content-Type: application/json" \
-    --header "X-API-Key: ${MINT_API_KEY}" \
-    --data "${BODY}" \
-    --write-out "\n%{http_code}" 2>/dev/null)
-
-  HTTP_STATUS=$(echo "${HTTP_RESPONSE}" | tail -n1)
-  RESPONSE=$(echo "${HTTP_RESPONSE}" | sed '$d')
-
-  if [[ "${HTTP_STATUS}" -lt 200 || "${HTTP_STATUS}" -ge 300 ]]; then
-    echo "Error: gateway API key request failed (HTTP ${HTTP_STATUS})." >&2
-    echo "Response: ${RESPONSE}" >&2
-    exit 1
-  fi
-
-  if command -v jq &>/dev/null; then
-    USER_API_KEY=$(echo "${RESPONSE}" | jq -r '.apiKey // empty')
-  else
-    USER_API_KEY=$(echo "${RESPONSE}" | grep -o '"apiKey":"[^"]*"' | cut -d'"' -f4)
-  fi
-
-  if [[ -z "${USER_API_KEY}" ]]; then
-    echo "Error: could not extract apiKey from response." >&2
-    echo "Response: ${RESPONSE}" >&2
-    exit 1
-  fi
-
-  echo "API key created successfully."
-fi
-echo ""
-
-# -----------------------------------------------------------------------------
-# 4b. Verify the user has gateway access (checks users-access list)
+# 3c. Verify the user has gateway access (checks users-access list)
 #     users-access only returns gatewayUserId (no email); GATEWAY_USER_ID was
 #     already resolved above, so we just check whether that id appears as a
 #     gatewayUserId in the gateway's users-access list.
 # -----------------------------------------------------------------------------
-ACCESS_ENDPOINT="${BASE_URL}/v1/GatewayConfiguration/${GATEWAY_CONFIGURATION_ID}/users-access"
 GATEWAY_EDIT_URL="${APP_BASE_URL}/gateway/ai/${GATEWAY_CONFIGURATION_ID}/edit?pageNumber=1&pageSize=50"
+ACCESS_ENDPOINT="${BASE_URL}/v1/GatewayConfiguration/${GATEWAY_CONFIGURATION_ID}/users-access"
 
 check_gateway_access_for_id() {
   local user_id="$1"
@@ -425,14 +308,83 @@ fi
 echo ""
 
 # -----------------------------------------------------------------------------
+# 4. Get the user's personal gateway API key.
+#    Airia no longer lets an API key (admin or developer) mint gateway keys:
+#    POST /v1/GatewayApiKey returns 403 "api_key_caller_not_allowed", and
+#    GET /v1/GatewayApiKey/{keyId} (which revealed an existing key's value)
+#    is blocked as well. An admin signed in to the Airia console creates the
+#    key there and pastes it in here. GET /v1/GatewayConfiguration/{id} still
+#    works with an API key, so it's used only to warn when the user already
+#    has enabled keys on this configuration.
+# -----------------------------------------------------------------------------
+if [[ -n "${GATEWAY_USER_ID}" ]]; then
+  CONFIG_RESPONSE=$(curl --silent --show-error \
+    --request GET \
+    --url "${BASE_URL}/v1/GatewayConfiguration/${GATEWAY_CONFIGURATION_ID}" \
+    --header "X-API-Key: ${MINT_API_KEY}" 2>/dev/null) || true
+
+  EXISTING_KEY_IDS=""
+  if command -v jq &>/dev/null; then
+    EXISTING_KEY_IDS=$(echo "${CONFIG_RESPONSE}" | jq -r --arg uid "${GATEWAY_USER_ID}" \
+      '.apiKeys[]? | select(.resourceId == $uid and .enabled == true) | .id' 2>/dev/null) || true
+  elif command -v python3 &>/dev/null; then
+    EXISTING_KEY_IDS=$(python3 -c "
+import json, sys
+try:
+    data = json.loads(sys.argv[1])
+except Exception:
+    sys.exit(0)
+uid = sys.argv[2]
+for k in data.get('apiKeys', []):
+    if k.get('resourceId') == uid and k.get('enabled'):
+        print(k.get('id', ''))
+" "${CONFIG_RESPONSE}" "${GATEWAY_USER_ID}") || true
+  fi
+
+  if [[ -n "${EXISTING_KEY_IDS}" ]]; then
+    EXISTING_KEY_COUNT=$(echo "${EXISTING_KEY_IDS}" | wc -l | tr -d ' ')
+    echo "Note: '${USER_EMAIL}' already has ${EXISTING_KEY_COUNT} enabled gateway API key(s) on this configuration."
+    echo "If you still have one of those key values, you can paste it below instead of creating another."
+    echo ""
+  fi
+fi
+
+echo "An admin must create the user's gateway API key in the Airia console"
+echo "(API keys can no longer mint gateway keys):"
+echo "  1. Sign in to Airia as an admin and open: Secure > Gateway > this configuration"
+echo "     ${GATEWAY_EDIT_URL}"
+echo "  2. Create a new User API key for ${USER_EMAIL}."
+echo "  3. Copy the full key value when it's shown (it's typically only shown once)."
+echo ""
+USER_API_KEY=""
+while [[ -z "${USER_API_KEY}" ]]; do
+  read -rsp "Paste the user's gateway API key (input hidden): " USER_API_KEY
+  echo ""
+  USER_API_KEY="${USER_API_KEY//[[:space:]]/}"
+  if [[ -z "${USER_API_KEY}" ]]; then
+    echo "A gateway API key is required. Create one at the link above, then paste it here." >&2
+  elif [[ "${USER_API_KEY}" == *"•"* ]]; then
+    echo "That looks like a masked value (contains •). Copy the full key value, not the masked preview." >&2
+    USER_API_KEY=""
+  fi
+done
+echo "Gateway API key received: ${USER_API_KEY:0:6}…${USER_API_KEY: -4}"
+echo ""
+
+# -----------------------------------------------------------------------------
 # 5. OTLP endpoint (derived from BASE_URL) + OTLP API key
-#    Defaults to the same admin key used to mint the gateway key (MINT_API_KEY)
+#    Defaults to MINT_API_KEY (the admin/developer key in .env)
 #    unless the user wants to provide a separate one for telemetry ingestion.
 # -----------------------------------------------------------------------------
 OTLP_ENDPOINT_BASE="${BASE_URL}"
 echo "OTLP endpoint will be: ${OTLP_ENDPOINT_BASE}/v1/ClaudeCodeOtelIngest/ingest"
 
-read -rp "Provide a separate OTLP API key (X-API-Key header for telemetry ingestion)? [y/N]: " OTLP_KEY_CHOICE
+if [[ -z "${MINT_API_KEY}" ]]; then
+  echo "MINT_API_KEY isn't set, so an OTLP API key must be entered directly."
+  OTLP_KEY_CHOICE="y"
+else
+  read -rp "Provide a separate OTLP API key (X-API-Key header for telemetry ingestion)? [y/N]: " OTLP_KEY_CHOICE
+fi
 if [[ "${OTLP_KEY_CHOICE}" =~ ^[Yy] ]]; then
   read -rp "Enter the OTLP API key: " OTLP_API_KEY
   if [[ -z "${OTLP_API_KEY}" ]]; then

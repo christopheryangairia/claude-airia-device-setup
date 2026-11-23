@@ -9,8 +9,8 @@
 #     2. Ask for the AI Gateway URL (suggesting the standard pattern for the
 #        detected region: https://<region>.gateway.airia.ai/)
 #     3. Ask for the user's email address
-#     4. Request a personal Gateway API key from Airia (User key type) using
-#        that email
+#     4. Have the admin paste the user's personal Gateway API key, created
+#        in the Airia console (API keys can no longer mint gateway keys)
 #     5. Derive the OTLP endpoint from the same BASE_URL, and ask for the
 #        OTLP API key (X-API-Key header used for telemetry ingestion)
 #     6. Optionally ask for an MCP server name + URL to manage
@@ -53,21 +53,30 @@ $REG_TEMPLATE = Join-Path $ROOT_DIR "templates/Claude.reg"
 $MOBILECONFIG_TEMPLATE = Join-Path $ROOT_DIR "templates/Claude.mobileconfig"
 
 # -----------------------------------------------------------------------------
-# Fixed admin credentials used only to mint a personal user API key.
-# These are tied to a specific Airia gateway configuration - update them if
-# your organization uses a different admin key / configuration id.
+# Admin config for this Airia gateway configuration. GATEWAY_CONFIGURATION_ID
+# is required. MINT_API_KEY (an admin or developer API key) is optional: it's
+# used only for read-only lookups (user directory, existing keys, access list)
+# and as the default OTLP key. It no longer mints user keys - Airia rejects
+# POST /v1/GatewayApiKey from any API key, so an admin creates the user's key
+# in the console and pastes it in when prompted.
 # The script will read `MINT_API_KEY` and `GATEWAY_CONFIGURATION_ID` from a
 # local `.env` file (or the process environment) if set.
 # -----------------------------------------------------------------------------
 $MINT_API_KEY = if ($env:MINT_API_KEY) { $env:MINT_API_KEY } else { "" }
 $GATEWAY_CONFIGURATION_ID = if ($env:GATEWAY_CONFIGURATION_ID) { $env:GATEWAY_CONFIGURATION_ID } else { "" }
-$KEY_TYPE = "User"
-$ENABLED = $true
+
+if (-not $GATEWAY_CONFIGURATION_ID) {
+    Write-Host "Warning: GATEWAY_CONFIGURATION_ID is not set. Add it to .env in the project root." -ForegroundColor Yellow
+}
+if (-not $MINT_API_KEY) {
+    Write-Host "Note: MINT_API_KEY is not set - the user lookup and gateway-access check will be" -ForegroundColor Yellow
+    Write-Host "skipped, and you'll be asked for an OTLP key directly." -ForegroundColor Yellow
+}
 
 Write-Host "============================================================"
 Write-Host " Claude Desktop - Airia Gateway Setup"
 Write-Host "============================================================"
-Write-Host "This will request a personal Airia gateway API key for a user"
+Write-Host "This will take a personal Airia gateway API key for a user (created by an admin in the console)"
 Write-Host "and generate a ready-to-install Claude Desktop config file"
 Write-Host "(Windows .reg and/or macOS .mobileconfig) with that key baked in."
 Write-Host ""
@@ -208,113 +217,13 @@ $GATEWAY_USER_ID = Resolve-GatewayUserId
 Write-Host ""
 
 # -----------------------------------------------------------------------------
-# 3c. Check for an existing gateway API key for this user before minting a
-#     new one. GET /v1/GatewayConfiguration/{id} lists apiKeys[] (masked
-#     values only) with a resourceId matching the platform user id above.
-#     GET /v1/GatewayApiKey/{keyId} can return the full value, but has proven
-#     unreliable (404s on some otherwise-valid, enabled keys) - if it fails we
-#     fall back to minting a new key rather than blocking.
-# -----------------------------------------------------------------------------
-$USER_API_KEY = $null
-if ($GATEWAY_USER_ID) {
-    Write-Host "Checking for existing gateway API keys for $USER_EMAIL..."
-    $mintHeaders = @{ "X-API-Key" = $MINT_API_KEY }
-    try {
-        $configResponse = Invoke-RestMethod -Uri "$BASE_URL/v1/GatewayConfiguration/$GATEWAY_CONFIGURATION_ID" -Method Get -Headers $mintHeaders
-    } catch {
-        $configResponse = $null
-    }
-
-    $existingKeys = @()
-    if ($configResponse -and $configResponse.apiKeys) {
-        $existingKeys = @($configResponse.apiKeys | Where-Object { $_.resourceId -eq $GATEWAY_USER_ID -and $_.enabled })
-    }
-
-    if ($existingKeys.Count -gt 0) {
-        Write-Host "User API key detected: found $($existingKeys.Count) existing enabled gateway API key(s) for '$USER_EMAIL'."
-        $REUSE_CHOICE = Read-Host "Use an existing key instead of creating another? [y/N]"
-        if ($REUSE_CHOICE -match '^[Yy]') {
-            $reuseKeyId = $existingKeys[0].id
-            $fetchedKey = $null
-            try {
-                $fetched = Invoke-RestMethod -Uri "$BASE_URL/v1/GatewayApiKey/$reuseKeyId" -Method Get -Headers $mintHeaders
-                $fetchedKey = $fetched.apiKey
-            } catch {
-                $fetchedKey = $null
-            }
-
-            if ($fetchedKey -and $fetchedKey.Contains([char]0x2022)) {
-                Write-Host "The retrieved key value is masked/obfuscated: $fetchedKey"
-                $MANUAL_KEY = Read-Host "Paste the real key manually (or leave blank to create a new one instead)"
-                if (-not [string]::IsNullOrWhiteSpace($MANUAL_KEY)) {
-                    $USER_API_KEY = $MANUAL_KEY
-                    Write-Host "Using manually entered key."
-                } else {
-                    Write-Host "No key entered - a new key will be created instead."
-                }
-            } elseif ($fetchedKey) {
-                $USER_API_KEY = $fetchedKey
-                Write-Host "Reusing existing gateway API key."
-            } else {
-                Write-Host "Warning: could not retrieve the existing key's value via the API - a new key will be created instead." -ForegroundColor Yellow
-            }
-        }
-    }
-}
-Write-Host ""
-
-# -----------------------------------------------------------------------------
-# 4. Create the gateway API key (skipped if an existing key was reused above)
-# -----------------------------------------------------------------------------
-if (-not $USER_API_KEY) {
-    Write-Host "Requesting gateway API key from Airia..."
-
-    $ENDPOINT = "$BASE_URL/v1/GatewayApiKey"
-    $BODY = @{
-        gatewayConfigurationId = $GATEWAY_CONFIGURATION_ID
-        type                   = $KEY_TYPE
-        enabled                = $ENABLED
-        email                  = $USER_EMAIL
-    } | ConvertTo-Json
-
-    $headers = @{
-        "Content-Type" = "application/json"
-        "X-API-Key"    = $MINT_API_KEY
-    }
-
-    try {
-        $response = Invoke-RestMethod -Uri $ENDPOINT -Method Post -Headers $headers -Body $BODY
-        $USER_API_KEY = $response.apiKey
-    } catch {
-        Write-Host "Error: gateway API key request failed." -ForegroundColor Red
-        if ($_.Exception.Response) {
-            $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
-            Write-Host "Response: $($reader.ReadToEnd())" -ForegroundColor Red
-        } else {
-            Write-Host "Exception: $($_.Exception.Message)" -ForegroundColor Red
-        }
-        Read-Host "Press Enter to exit"
-        Exit
-    }
-
-    if ([string]::IsNullOrWhiteSpace($USER_API_KEY)) {
-        Write-Host "Error: could not extract apiKey from response." -ForegroundColor Red
-        Read-Host "Press Enter to exit"
-        Exit
-    }
-
-    Write-Host "API key created successfully."
-}
-Write-Host ""
-
-# -----------------------------------------------------------------------------
-# 4b. Verify the user has gateway access (checks users-access list)
+# 3c. Verify the user has gateway access (checks users-access list)
 #     users-access only returns gatewayUserId (no email); GATEWAY_USER_ID was
 #     already resolved above, so we just check whether that id appears as a
 #     gatewayUserId in the gateway's users-access list.
 # -----------------------------------------------------------------------------
-$ACCESS_ENDPOINT = "$BASE_URL/v1/GatewayConfiguration/$GATEWAY_CONFIGURATION_ID/users-access"
 $GATEWAY_EDIT_URL = "$APP_BASE_URL/gateway/ai/$GATEWAY_CONFIGURATION_ID/edit?pageNumber=1&pageSize=50"
+$ACCESS_ENDPOINT = "$BASE_URL/v1/GatewayConfiguration/$GATEWAY_CONFIGURATION_ID/users-access"
 
 function Test-GatewayAccessForId($userId) {
     if (-not $userId) { return $false }
@@ -359,14 +268,68 @@ if (-not $GATEWAY_USER_ID) {
 Write-Host ""
 
 # -----------------------------------------------------------------------------
+# 4. Get the user's personal gateway API key.
+#    Airia no longer lets an API key (admin or developer) mint gateway keys:
+#    POST /v1/GatewayApiKey returns 403 "api_key_caller_not_allowed", and
+#    GET /v1/GatewayApiKey/{keyId} (which revealed an existing key's value)
+#    is blocked as well. An admin signed in to the Airia console creates the
+#    key there and pastes it in here. GET /v1/GatewayConfiguration/{id} still
+#    works with an API key, so it's used only to warn when the user already
+#    has enabled keys on this configuration.
+# -----------------------------------------------------------------------------
+if ($GATEWAY_USER_ID) {
+    try {
+        $configResponse = Invoke-RestMethod -Uri "$BASE_URL/v1/GatewayConfiguration/$GATEWAY_CONFIGURATION_ID" -Method Get -Headers @{ "X-API-Key" = $MINT_API_KEY }
+    } catch {
+        $configResponse = $null
+    }
+    $existingKeys = @()
+    if ($configResponse -and $configResponse.apiKeys) {
+        $existingKeys = @($configResponse.apiKeys | Where-Object { $_.resourceId -eq $GATEWAY_USER_ID -and $_.enabled })
+    }
+    if ($existingKeys.Count -gt 0) {
+        Write-Host "Note: '$USER_EMAIL' already has $($existingKeys.Count) enabled gateway API key(s) on this configuration."
+        Write-Host "If you still have one of those key values, you can paste it below instead of creating another."
+        Write-Host ""
+    }
+}
+
+Write-Host "An admin must create the user's gateway API key in the Airia console"
+Write-Host "(API keys can no longer mint gateway keys):"
+Write-Host "  1. Sign in to Airia as an admin and open: Secure > Gateway > this configuration"
+Write-Host "     $GATEWAY_EDIT_URL"
+Write-Host "  2. Create a new User API key for $USER_EMAIL."
+Write-Host "  3. Copy the full key value when it's shown (it's typically only shown once)."
+Write-Host ""
+$USER_API_KEY = ""
+while (-not $USER_API_KEY) {
+    $secureKey = Read-Host "Paste the user's gateway API key (input hidden)" -AsSecureString
+    $USER_API_KEY = ([System.Net.NetworkCredential]::new("", $secureKey).Password) -replace '\s', ''
+    if (-not $USER_API_KEY) {
+        Write-Host "A gateway API key is required. Create one at the link above, then paste it here." -ForegroundColor Yellow
+    } elseif ($USER_API_KEY.Contains([char]0x2022)) {
+        Write-Host "That looks like a masked value (contains a bullet). Copy the full key value, not the masked preview." -ForegroundColor Yellow
+        $USER_API_KEY = ""
+    }
+}
+$keyPreview = if ($USER_API_KEY.Length -gt 10) { $USER_API_KEY.Substring(0, 6) + "..." + $USER_API_KEY.Substring($USER_API_KEY.Length - 4) } else { "(short value)" }
+Write-Host "Gateway API key received: $keyPreview"
+Write-Host ""
+
+# -----------------------------------------------------------------------------
 # 5. OTLP endpoint (derived from BASE_URL) + OTLP API key
-#    Defaults to the same admin key used to mint the gateway key (MINT_API_KEY)
+#    Defaults to MINT_API_KEY (the admin/developer key in .env)
 #    unless the user wants to provide a separate one for telemetry ingestion.
 # -----------------------------------------------------------------------------
 $OTLP_ENDPOINT_BASE = $BASE_URL
 Write-Host "OTLP endpoint will be: $OTLP_ENDPOINT_BASE/v1/ClaudeCodeOtelIngest/ingest"
 
-$OTLP_KEY_CHOICE = Read-Host "Provide a separate OTLP API key (X-API-Key header for telemetry ingestion)? [y/N]"
+if (-not $MINT_API_KEY) {
+    Write-Host "MINT_API_KEY isn't set, so an OTLP API key must be entered directly."
+    $OTLP_KEY_CHOICE = "y"
+} else {
+    $OTLP_KEY_CHOICE = Read-Host "Provide a separate OTLP API key (X-API-Key header for telemetry ingestion)? [y/N]"
+}
 if ($OTLP_KEY_CHOICE -match '^[Yy]') {
     $OTLP_API_KEY = Read-Host "Enter the OTLP API key"
     if ([string]::IsNullOrWhiteSpace($OTLP_API_KEY)) {
